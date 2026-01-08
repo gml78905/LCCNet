@@ -1,0 +1,1 @@
+docker build -t lccnet:rtx3080 .

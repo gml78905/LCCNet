@@ -291,6 +291,7 @@ class LCCNet(nn.Module):
         self.layer4_lidar = self._make_layer(block, 512, layers[3], stride=2)
 
         self.corr = Correlation(pad_size=md, kernel_size=1, max_displacement=md, stride1=1, stride2=1, corr_multiply=1)
+        # self.corr = nn.Sequential()
         self.leakyRELU = nn.LeakyReLU(0.1)
 
         nd = (2 * md + 1) ** 2

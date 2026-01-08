@@ -50,7 +50,7 @@ ex.captured_out_filter = apply_backspaces_and_linefeeds
 def config():
     checkpoints = './checkpoints/'
     dataset = 'kitti/odom' # 'kitti/raw'
-    data_folder = '/home/wangshuo/Datasets/KITTI/odometry/data_odometry_full/'
+    data_folder = '/ws/data/PublicDataset/KITTI'
     use_reflectance = False
     val_sequence = 0
     epochs = 120
@@ -63,7 +63,7 @@ def config():
     network = 'Res_f1'
     optimizer = 'adam'
     resume = True
-    weights = './pretrained/kitti/kitti_iter5.tar'
+    weights = '/ws/data/Checkpoint/LCCNet/kitti_iter5.tar'
     rescale_rot = 1.0
     rescale_transl = 2.0
     precision = "O0"

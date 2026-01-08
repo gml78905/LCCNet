@@ -1,0 +1,21 @@
+# .gitignore 파일 생성
+cat <<EOF > .gitignore
+# Python 캐시 파일
+__pycache__/
+*.pyc
+
+# IDE 설정 파일 (나만 쓰는 설정)
+.idea/
+.vscode/
+
+# 빌드 및 컴파일된 파일 (가장 중요!)
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+
+# 데이터셋이나 모델 가중치 (용량 큰 것들)
+data/
+*.pth
+EOF
