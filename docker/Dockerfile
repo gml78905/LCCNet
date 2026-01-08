@@ -29,8 +29,10 @@ WORKDIR /workspace/LCCNet
 # 5. Python 라이브러리 설치
 # (수정한 requirements_fixed.txt 파일을 컨테이너로 복사 후 설치)
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir trimesh
 
 # 6. 기본 쉘 설정
 CMD ["/bin/bash"]

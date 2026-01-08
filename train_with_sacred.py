@@ -28,6 +28,7 @@ from sacred import Experiment
 from sacred.utils import apply_backspaces_and_linefeeds
 
 from DatasetLidarCamera import DatasetLidarCameraKittiOdometry
+from DatasetCameraRadar import DatasetCameraRadarHercules
 from losses import DistancePoints3D, GeometricLoss, L1Loss, ProposedLoss, CombinedLoss
 from models.LCCNet import LCCNet
 
@@ -41,7 +42,10 @@ from utils import (mat2xyzrpy, merge_inputs, overlay_imgs, quat2mat,
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = False
 
-ex = Experiment("LCCNet")
+# Disable git info to avoid errors in Docker containers
+# In Docker, git repository may not work properly, so disable it
+save_git_info = False
+ex = Experiment("LCCNet", save_git_info=save_git_info)
 ex.captured_out_filter = apply_backspaces_and_linefeeds
 
 
@@ -49,21 +53,23 @@ ex.captured_out_filter = apply_backspaces_and_linefeeds
 @ex.config
 def config():
     checkpoints = './checkpoints/'
-    dataset = 'kitti/odom' # 'kitti/raw'
-    data_folder = '/ws/data/PublicDataset/KITTI'
+    dataset = 'hercules' # 'kitti/odom', 'kitti/raw', 'hercules'
+    data_folder = '/workspace/data/PublicDataset/hercules'
     use_reflectance = False
-    val_sequence = 0
+    val_sequence = 0  # For KITTI
+    val_scene = ['parking_lot_1', 'parking_lot_2', 'parking_lot_4']  # For Hercules (None = use first scene, list = use multiple scenes)
+    val_scene_name = "test"  # For Hercules: custom name for saving (None = auto-generate from val_scene)
     epochs = 120
     BASE_LEARNING_RATE = 3e-4  # 1e-4
     loss = 'combined'
     max_t = 0.1 # 1.5, 1.0,  0.5,  0.2,  0.1
     max_r = 1. # 20.0, 10.0, 5.0,  2.0,  1.0
-    batch_size = 240  # 120
-    num_worker = 6
+    batch_size = 32  # 120
+    num_worker = 0
     network = 'Res_f1'
     optimizer = 'adam'
     resume = True
-    weights = '/ws/data/Checkpoint/LCCNet/kitti_iter5.tar'
+    weights = 'None'  # '/workspace/data/Checkpoint/LCCNet/kitti_iter5.tar'  # Set to None to start from scratch for Hercules
     rescale_rot = 1.0
     rescale_transl = 2.0
     precision = "O0"
@@ -180,26 +186,92 @@ def main(_config, _run, seed):
     global EPOCH
     print('Loss Function Choice: {}'.format(_config['loss']))
 
-    if _config['val_sequence'] is None:
-        raise TypeError('val_sequences cannot be None')
+    if _config['dataset'] == 'hercules':
+        print("Using Hercules Camera-Radar dataset")
+        val_scene = _config['val_scene']
+        if val_scene is None:
+            # Get all scene directories
+            scene_list = [d for d in os.listdir(_config['data_folder']) 
+                         if os.path.isdir(os.path.join(_config['data_folder'], d))]
+            scene_list.sort()
+            
+            # Find scenes with calibration.yaml (could be in scene or subfolder like CMRNext)
+            valid_scenes = []
+            for scene in scene_list:
+                scene_path = os.path.join(_config['data_folder'], scene)
+                # Check if calibration.yaml is directly in scene folder
+                if os.path.exists(os.path.join(scene_path, 'calibration.yaml')):
+                    valid_scenes.append(scene)
+                else:
+                    subdir_path = os.path.join(scene_path, 'CMRNext')
+                    if os.path.isdir(subdir_path):
+                        if os.path.exists(os.path.join(subdir_path, 'calibration.yaml')):
+                            valid_scenes.append(scene)
+            
+            if len(valid_scenes) > 0:
+                val_scene = valid_scenes[0]
+                print(f"Found {len(valid_scenes)} valid scenes: {valid_scenes}")
+            else:
+                raise ValueError(f"No valid scenes found in Hercules dataset at {_config['data_folder']}")
+        
+        # Convert single scene to list if needed
+        if isinstance(val_scene, str):
+            val_scene = [val_scene]
+        
+        print("Val Scenes: ", val_scene)
+        dataset_class = DatasetCameraRadarHercules
     else:
-        _config['val_sequence'] = f"{_config['val_sequence']:02d}"
-        print("Val Sequence: ", _config['val_sequence'])
-        dataset_class = DatasetLidarCameraKittiOdometry
+        val_sequence = _config['val_sequence']
+        if val_sequence is None:
+            raise TypeError('val_sequences cannot be None')
+        else:
+            val_sequence = f"{val_sequence:02d}"
+            print("Val Sequence: ", val_sequence)
+            if _config['dataset'] == 'kitti/odom':
+                dataset_class = DatasetLidarCameraKittiOdometry
+            elif _config['dataset'] == 'kitti/raw':
+                from DatasetLidarCamera import DatasetLidarCameraKittiRaw
+                dataset_class = DatasetLidarCameraKittiRaw
+            else:
+                raise ValueError(f"Unknown dataset: {_config['dataset']}")
     img_shape = (384, 1280) # 网络的输入尺度
     input_size = (256, 512)
-    _config["checkpoints"] = os.path.join(_config["checkpoints"], _config['dataset'])
+    checkpoints_dir = os.path.join(_config["checkpoints"], _config['dataset'])
 
-    dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                  split='train', use_reflectance=_config['use_reflectance'],
-                                  val_sequence=_config['val_sequence'])
-    dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                split='val', use_reflectance=_config['use_reflectance'],
-                                val_sequence=_config['val_sequence'])
-    model_savepath = os.path.join(_config['checkpoints'], 'val_seq_' + _config['val_sequence'], 'models')
+    if _config['dataset'] == 'hercules':
+        dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                      split='train', use_reflectance=_config['use_reflectance'],
+                                      val_scene=val_scene)
+        dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                    split='val', use_reflectance=_config['use_reflectance'],
+                                    val_scene=val_scene)
+    else:
+        dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                      split='train', use_reflectance=_config['use_reflectance'],
+                                      val_sequence=val_sequence)
+        dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                    split='val', use_reflectance=_config['use_reflectance'],
+                                    val_sequence=val_sequence)
+    if _config['dataset'] == 'hercules':
+        # Use val_scene_name from config if provided, otherwise auto-generate
+        if _config.get('val_scene_name') is not None:
+            val_scene_name = _config['val_scene_name']
+        else:
+            # Auto-generate from val_scene list
+            if isinstance(val_scene, list):
+                val_scene_name = '_'.join(val_scene)
+            else:
+                val_scene_name = str(val_scene)
+        model_savepath = os.path.join(checkpoints_dir, val_scene_name, 'models')
+    else:
+        model_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'models')
     if not os.path.exists(model_savepath):
         os.makedirs(model_savepath)
-    log_savepath = os.path.join(_config['checkpoints'], 'val_seq_' + _config['val_sequence'], 'log')
+    if _config['dataset'] == 'hercules':
+        # Use the same val_scene_name for log path
+        log_savepath = os.path.join(checkpoints_dir, val_scene_name, 'log')
+    else:
+        log_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'log')
     if not os.path.exists(log_savepath):
         os.makedirs(log_savepath)
     train_writer = SummaryWriter(os.path.join(log_savepath, 'train'))
@@ -276,11 +348,13 @@ def main(_config, _run, seed):
                          Action_Func='leakyrelu', attention=False, res_num=18)
     else:
         raise TypeError("Network unknown")
-    if _config['weights'] is not None:
+    if _config['weights'] is not None and os.path.exists(_config['weights']):
         print(f"Loading weights from {_config['weights']}")
         checkpoint = torch.load(_config['weights'], map_location='cpu')
         saved_state_dict = checkpoint['state_dict']
         model.load_state_dict(saved_state_dict)
+    elif _config['weights'] is not None:
+        print(f"Warning: Weights file not found: {_config['weights']}. Starting from scratch.")
 
         # original saved file with DataParallel
         # state_dict = torch.load(model_path)
@@ -311,11 +385,12 @@ def main(_config, _run, seed):
                               weight_decay=5e-6, nesterov=True)
 
     starting_epoch = _config['starting_epoch']
-    if _config['weights'] is not None and _config['resume']:
+    if _config['weights'] is not None and _config['resume'] and os.path.exists(_config['weights']):
         checkpoint = torch.load(_config['weights'], map_location='cpu')
-        opt_state_dict = checkpoint['optimizer']
-        optimizer.load_state_dict(opt_state_dict)
-        if starting_epoch != 0:
+        if 'optimizer' in checkpoint:
+            opt_state_dict = checkpoint['optimizer']
+            optimizer.load_state_dict(opt_state_dict)
+        if starting_epoch != 0 and 'epoch' in checkpoint:
             starting_epoch = checkpoint['epoch']
 
     # Allow mixed-precision if needed
@@ -327,6 +402,7 @@ def main(_config, _run, seed):
 
     train_iter = 0
     val_iter = 0
+    starting_epoch = 0
     for epoch in range(starting_epoch, _config['epochs'] + 1):
         EPOCH = epoch
         print('This is %d-th epoch' % epoch)
