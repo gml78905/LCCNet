@@ -615,7 +615,6 @@ def main(_config, _run, seed):
             total_train_loss += loss['total_loss'].item() * len(sample['rgb'])
             train_iter += 1
             # total_iter += len(sample['rgb'])
-            break
 
         print("------------------------------------")
         print('epoch %d total training loss = %.3f' % (epoch, total_train_loss / len(dataset_train)))
@@ -772,7 +771,6 @@ def main(_config, _run, seed):
                 local_loss = 0.0
             total_val_loss += loss['total_loss'].item() * len(sample['rgb'])
             val_iter += 1
-            break
 
         print("------------------------------------")
         print('total val loss = %.3f' % (total_val_loss / len(dataset_val)))
