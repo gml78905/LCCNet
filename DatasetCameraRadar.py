@@ -29,7 +29,7 @@ class ReadOpen3d:
 class DatasetCameraRadarHercules(Dataset):
 
     def __init__(self, dataset_dir, transform=None, augmentation=False, use_reflectance=False,
-                 max_t=1.5, max_r=20., split='val', device='cpu', val_scene=None, suf='.png'):
+                 max_t=1.5, max_r=20., split='val', device='cpu', val_scene=None, train_scene=None, suf='.png'):
         super(DatasetCameraRadarHercules, self).__init__()
         self.use_reflectance = use_reflectance
         self.device = device
@@ -80,8 +80,20 @@ class DatasetCameraRadarHercules(Dataset):
         if isinstance(val_scene, str):
             val_scene = [val_scene]
         
+        # Handle train_scene
+        if train_scene is not None:
+            if isinstance(train_scene, str):
+                train_scene = [train_scene]
+            # Remove any overlap with val_scene
+            train_scene = [s for s in train_scene if s not in val_scene]
+        
         self.val_scene = val_scene
+        self.train_scene = train_scene
         print(f"Validation scenes: {val_scene}")
+        if train_scene is not None:
+            print(f"Train scenes: {train_scene}")
+        else:
+            print(f"Train scenes: All scenes except val_scene")
         print(f"Total scenes: {len(self.scene_data_dirs)}")
         
         # Load calibration data for each scene
@@ -184,8 +196,15 @@ class DatasetCameraRadarHercules(Dataset):
                 if scene in val_scene:
                     if split.startswith('val') or split == 'test':
                         self.all_files.append(os.path.join(scene, base_name))
-                elif scene not in val_scene and split == 'train':
-                    self.all_files.append(os.path.join(scene, base_name))
+                elif split == 'train':
+                    # If train_scene is specified, only use those scenes
+                    if self.train_scene is not None:
+                        if scene in self.train_scene:
+                            self.all_files.append(os.path.join(scene, base_name))
+                    else:
+                        # Otherwise, use all scenes except val_scene
+                        if scene not in val_scene:
+                            self.all_files.append(os.path.join(scene, base_name))
         
         # Test open3d with first pcd file if available
         self.pcd_reader = None

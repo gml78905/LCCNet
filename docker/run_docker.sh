@@ -22,7 +22,7 @@ fi
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # 데이터 디렉토리 경로
-DATA_DIR="/media/gml78905/T71/project_data/LG_Innotek"
+DATA_DIR="/media/TrainDataset/"
 
 # 기존 컨테이너가 실행 중이면 중지 및 제거
 if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then

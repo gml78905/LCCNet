@@ -22,12 +22,13 @@ import torch.nn.functional as F
 import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
+from torch.utils.data import ConcatDataset
 import torch.nn as nn
 
 from sacred import Experiment
 from sacred.utils import apply_backspaces_and_linefeeds
 
-from DatasetLidarCamera import DatasetLidarCameraKittiOdometry
+from DatasetLidarCamera import DatasetLidarCameraKittiOdometry, DatasetLidarCameraHercules
 from DatasetCameraRadar import DatasetCameraRadarHercules
 from losses import DistancePoints3D, GeometricLoss, L1Loss, ProposedLoss, CombinedLoss
 from models.LCCNet import LCCNet
@@ -52,19 +53,21 @@ ex.captured_out_filter = apply_backspaces_and_linefeeds
 # noinspection PyUnusedLocal
 @ex.config
 def config():
-    checkpoints = './checkpoints/'
+    checkpoints = '/workspace/data/checkpoints/LCCNet/'
     dataset = 'hercules' # 'kitti/odom', 'kitti/raw', 'hercules'
-    data_folder = '/workspace/data/PublicDataset/hercules'
+    sensor_mode = 'lidar'  # For Hercules: 'lidar', 'radar', or 'both'
+    data_folder = '/workspace/data/hercules'
     use_reflectance = False
     val_sequence = 0  # For KITTI
-    val_scene = ['parking_lot_1', 'parking_lot_2', 'parking_lot_4']  # For Hercules (None = use first scene, list = use multiple scenes)
-    val_scene_name = "radar"  # For Hercules: custom name for saving (None = auto-generate from val_scene)
+    val_scene = ['library_1']  # For Hercules (None = use first scene, list = use multiple scenes)
+    train_scene = ['SC_1', 'SC_3', 'island_1']  # For Hercules (None = use all scenes except val_scene, list = use specific scenes for training)
+    checkpoint_name = 'test'  # For Hercules: custom checkpoint name for saving (None = auto-generate from val_scene and sensor_mode)
     epochs = 120
     BASE_LEARNING_RATE = 1e-4  # 1e-4
     loss = 'combined'
-    max_t = 0.1 # 1.5, 1.0,  0.5,  0.2,  0.1
-    max_r = 1. # 20.0, 10.0, 5.0,  2.0,  1.0
-    batch_size = 32  # 120
+    max_t = 0.5 # 1.5, 1.0,  0.5,  0.2,  0.1
+    max_r = 5.0 # 20.0, 10.0, 5.0,  2.0,  1.0
+    batch_size = 120  # 120
     num_worker = 0
     network = 'Res_f1'
     optimizer = 'adam'
@@ -202,7 +205,14 @@ def main(_config, _run, seed):
     print('Loss Function Choice: {}'.format(_config['loss']))
 
     if _config['dataset'] == 'hercules':
-        print("Using Hercules Camera-Radar dataset")
+        sensor_mode = _config.get('sensor_mode', 'radar').lower()  # Default to 'radar' for backward compatibility
+        if sensor_mode not in ['lidar', 'radar', 'both']:
+            raise ValueError(f"Invalid sensor_mode: {sensor_mode}. Must be 'lidar', 'radar', or 'both'")
+        
+        if sensor_mode == 'both':
+            print(f"Using Hercules Camera-LIDAR and Camera-RADAR datasets (both)")
+        else:
+            print(f"Using Hercules Camera-{sensor_mode.upper()} dataset")
         val_scene = _config['val_scene']
         if val_scene is None:
             # Get all scene directories
@@ -233,8 +243,33 @@ def main(_config, _run, seed):
         if isinstance(val_scene, str):
             val_scene = [val_scene]
         
+        train_scene = _config.get('train_scene')
+        if train_scene is not None:
+            if isinstance(train_scene, str):
+                train_scene = [train_scene]
+            # Ensure no overlap between train_scene and val_scene
+            train_scene = [s for s in train_scene if s not in val_scene]
+            if len(train_scene) == 0:
+                print("Warning: All train_scene scenes are in val_scene. Using all scenes except val_scene for training.")
+                train_scene = None
+        
         print("Val Scenes: ", val_scene)
-        dataset_class = DatasetCameraRadarHercules
+        if train_scene is not None:
+            print("Train Scenes: ", train_scene)
+        else:
+            print("Train Scenes: All scenes except val_scene")
+        print(f"Sensor Mode: {sensor_mode.upper()}")
+        
+        # Select dataset class(es) based on sensor mode
+        if sensor_mode == 'lidar':
+            dataset_class = DatasetLidarCameraHercules
+            dataset_class_val = None  # Same as train
+        elif sensor_mode == 'radar':
+            dataset_class = DatasetCameraRadarHercules
+            dataset_class_val = None  # Same as train
+        else:  # both
+            dataset_class = [DatasetLidarCameraHercules, DatasetCameraRadarHercules]
+            dataset_class_val = None  # Same as train
     else:
         val_sequence = _config['val_sequence']
         if val_sequence is None:
@@ -254,12 +289,30 @@ def main(_config, _run, seed):
     checkpoints_dir = os.path.join(_config["checkpoints"], _config['dataset'])
 
     if _config['dataset'] == 'hercules':
-        dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                      split='train', use_reflectance=_config['use_reflectance'],
-                                      val_scene=val_scene)
-        dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                    split='val', use_reflectance=_config['use_reflectance'],
-                                    val_scene=val_scene)
+        if sensor_mode == 'both':
+            # Create both lidar and radar datasets
+            dataset_train_lidar = DatasetLidarCameraHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                             split='train', use_reflectance=_config['use_reflectance'],
+                                                             val_scene=val_scene, train_scene=train_scene)
+            dataset_train_radar = DatasetCameraRadarHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                             split='train', use_reflectance=_config['use_reflectance'],
+                                                             val_scene=val_scene, train_scene=train_scene)
+            dataset_train = ConcatDataset([dataset_train_lidar, dataset_train_radar])
+            
+            dataset_val_lidar = DatasetLidarCameraHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                          split='val', use_reflectance=_config['use_reflectance'],
+                                                          val_scene=val_scene)
+            dataset_val_radar = DatasetCameraRadarHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                          split='val', use_reflectance=_config['use_reflectance'],
+                                                          val_scene=val_scene)
+            dataset_val = ConcatDataset([dataset_val_lidar, dataset_val_radar])
+        else:
+            dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                          split='train', use_reflectance=_config['use_reflectance'],
+                                          val_scene=val_scene, train_scene=train_scene)
+            dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                        split='val', use_reflectance=_config['use_reflectance'],
+                                        val_scene=val_scene)
     else:
         dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
                                       split='train', use_reflectance=_config['use_reflectance'],
@@ -268,23 +321,23 @@ def main(_config, _run, seed):
                                     split='val', use_reflectance=_config['use_reflectance'],
                                     val_sequence=val_sequence)
     if _config['dataset'] == 'hercules':
-        # Use val_scene_name from config if provided, otherwise auto-generate
-        if _config.get('val_scene_name') is not None:
-            val_scene_name = _config['val_scene_name']
+        # Use checkpoint_name from config if provided, otherwise auto-generate
+        if _config.get('checkpoint_name') is not None:
+            checkpoint_name = _config['checkpoint_name']
         else:
-            # Auto-generate from val_scene list
+            # Auto-generate from val_scene list and sensor_mode
             if isinstance(val_scene, list):
-                val_scene_name = '_'.join(val_scene)
+                checkpoint_name = f"{'_'.join(val_scene)}_{sensor_mode}"
             else:
-                val_scene_name = str(val_scene)
-        model_savepath = os.path.join(checkpoints_dir, val_scene_name, 'models')
+                checkpoint_name = f"{val_scene}_{sensor_mode}"
+        model_savepath = os.path.join(checkpoints_dir, checkpoint_name, 'models')
     else:
         model_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'models')
     if not os.path.exists(model_savepath):
         os.makedirs(model_savepath)
     if _config['dataset'] == 'hercules':
-        # Use the same val_scene_name for log path
-        log_savepath = os.path.join(checkpoints_dir, val_scene_name, 'log')
+        # Use the same checkpoint_name for log path
+        log_savepath = os.path.join(checkpoints_dir, checkpoint_name, 'log')
     else:
         log_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'log')
     if not os.path.exists(log_savepath):
@@ -562,6 +615,7 @@ def main(_config, _run, seed):
             total_train_loss += loss['total_loss'].item() * len(sample['rgb'])
             train_iter += 1
             # total_iter += len(sample['rgb'])
+            break
 
         print("------------------------------------")
         print('epoch %d total training loss = %.3f' % (epoch, total_train_loss / len(dataset_train)))
@@ -718,6 +772,7 @@ def main(_config, _run, seed):
                 local_loss = 0.0
             total_val_loss += loss['total_loss'].item() * len(sample['rgb'])
             val_iter += 1
+            break
 
         print("------------------------------------")
         print('total val loss = %.3f' % (total_val_loss / len(dataset_val)))
