@@ -58,9 +58,9 @@ def config():
     use_reflectance = False
     val_sequence = 0  # For KITTI
     val_scene = ['parking_lot_1', 'parking_lot_2', 'parking_lot_4']  # For Hercules (None = use first scene, list = use multiple scenes)
-    val_scene_name = "test"  # For Hercules: custom name for saving (None = auto-generate from val_scene)
+    val_scene_name = "radar"  # For Hercules: custom name for saving (None = auto-generate from val_scene)
     epochs = 120
-    BASE_LEARNING_RATE = 3e-4  # 1e-4
+    BASE_LEARNING_RATE = 1e-4  # 1e-4
     loss = 'combined'
     max_t = 0.1 # 1.5, 1.0,  0.5,  0.2,  0.1
     max_r = 1. # 20.0, 10.0, 5.0,  2.0,  1.0
@@ -133,13 +133,27 @@ def train(model, optimizer, rgb_img, refl_img, target_transl, target_rot, loss_f
 
     # Run model
     transl_err, rot_err = model(rgb_img, refl_img)
+    
+    # Check for NaN in model outputs
+    if torch.isnan(transl_err).any() or torch.isnan(rot_err).any():
+        print("Warning: NaN detected in model outputs")
+        return {'total_loss': torch.tensor(0.0, device=rgb_img.device, requires_grad=True)}, rot_err, transl_err
 
     if loss == 'points_distance' or loss == 'combined':
         losses = loss_fn(point_clouds, target_transl, target_rot, transl_err, rot_err)
     else:
         losses = loss_fn(target_transl, target_rot, transl_err, rot_err)
+    
+    # Check for NaN in loss before backward
+    if torch.isnan(losses['total_loss']):
+        print("Warning: NaN detected in loss, skipping backward")
+        return losses, rot_err, transl_err
 
     losses['total_loss'].backward()
+    
+    # Gradient clipping to prevent NaN
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
     optimizer.step()
 
     return losses, rot_err, transl_err
@@ -164,7 +178,8 @@ def val(model, rgb_img, refl_img, target_transl, target_rot, loss_fn, point_clou
     # else:
     #     total_loss = loss_fn(point_clouds, target_transl, target_rot, transl_err, rot_err)
 
-    total_trasl_error = torch.tensor(0.0)
+    # Initialize on the same device as target_transl
+    total_trasl_error = torch.tensor(0.0, device=target_transl.device)
     total_rot_error = quaternion_distance(target_rot, rot_err, target_rot.device)
     total_rot_error = total_rot_error * 180. / math.pi
     for j in range(rgb_img.shape[0]):
