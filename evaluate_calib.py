@@ -152,8 +152,8 @@ def main(_config, seed):
 
     dataset_class = DatasetLidarCameraKittiOdometry
     # dataset_class = DatasetTest
-    img_shape = (384, 1280)
-    input_size = (256, 512)
+    img_shape = (720, 1280)
+    input_size = (288, 512)
 
     # split = 'test'
     if _config['random_initial_pose']:
@@ -384,8 +384,8 @@ def main(_config, seed):
 
         lidar_input = torch.stack(lidar_input)
         rgb_input = torch.stack(rgb_input)
-        rgb_resize = F.interpolate(rgb_input, size=[256, 512], mode="bilinear")
-        lidar_resize = F.interpolate(lidar_input, size=[256, 512], mode="bilinear")
+        rgb_resize = F.interpolate(rgb_input, size=[288, 512], mode="bilinear")
+        lidar_resize = F.interpolate(lidar_input, size=[288, 512], mode="bilinear")
 
 
         if _config['save_image']:
@@ -475,7 +475,7 @@ def main(_config, seed):
                 depth_img_pred /= _config['max_depth']
                 depth_pred = F.pad(depth_img_pred, shape_pad_input[0])
                 lidar = depth_pred.unsqueeze(0)
-                lidar_resize = F.interpolate(lidar, size=[256, 512], mode="bilinear")
+                lidar_resize = F.interpolate(lidar, size=[288, 512], mode="bilinear")
 
                 if iteration == len(weights)-1 and _config['save_image']:
                     # save the RGB pointcloud
@@ -777,4 +777,3 @@ def main(_config, seed):
     avg_time = total_time / len(TestImgLoader)
     print("average runing time on {} iteration: {} s".format(len(weights), avg_time))
     print("End!")
-

@@ -87,6 +87,8 @@ class DistancePoints3D(nn.Module):
         for i in range(len(point_clouds)):
             point_cloud_gt = point_clouds[i].to(transl_err.device)
             point_cloud_out = point_clouds[i].clone()
+            if point_cloud_gt.numel() == 0 or point_cloud_gt.shape[-1] == 0:
+                continue
 
             R_target = quat2mat(target_rot[i])
             T_target = tvector2mat(target_transl[i])
@@ -148,6 +150,8 @@ class CombinedLoss(nn.Module):
         for i in range(len(point_clouds)):
             point_cloud_gt = point_clouds[i].to(transl_err.device)
             point_cloud_out = point_clouds[i].clone()
+            if point_cloud_gt.numel() == 0 or point_cloud_gt.shape[-1] == 0:
+                continue
 
             R_target = quat2mat(target_rot[i])
             T_target = tvector2mat(target_transl[i])
@@ -169,10 +173,32 @@ class CombinedLoss(nn.Module):
         #print("3D Distance Time: ", end-start)
         total_loss = (1 - self.weight_point_cloud) * pose_loss +\
                      self.weight_point_cloud * (point_clouds_loss/target_transl.shape[0])
+
+        if not torch.isfinite(loss_transl):
+            print("Debug: loss_transl is not finite")
+            print(f"  target_transl finite: {torch.isfinite(target_transl).all().item()}")
+            print(f"  transl_err finite: {torch.isfinite(transl_err).all().item()}")
+            print(f"  transl_err min/max: {transl_err.min().item()} / {transl_err.max().item()}")
+        if not torch.isfinite(loss_rot):
+            print("Debug: loss_rot is not finite")
+            print(f"  target_rot finite: {torch.isfinite(target_rot).all().item()}")
+            print(f"  rot_err finite: {torch.isfinite(rot_err).all().item()}")
+            print(f"  target_rot norm mean: {torch.norm(target_rot, dim=1).mean().item()}")
+            print(f"  rot_err norm mean: {torch.norm(rot_err, dim=1).mean().item()}")
+        if not torch.isfinite(point_clouds_loss):
+            print("Debug: point_clouds_loss is not finite")
+            print(f"  point_cloud batch size: {len(point_clouds)}")
+            print(f"  first point_cloud finite: {torch.isfinite(point_clouds[0]).all().item() if len(point_clouds) > 0 else 'n/a'}")
+        if not torch.isfinite(total_loss):
+            print("Debug: total_loss is not finite")
+            print(f"  loss_transl: {loss_transl.item() if torch.is_tensor(loss_transl) else loss_transl}")
+            print(f"  loss_rot: {loss_rot.item() if torch.is_tensor(loss_rot) else loss_rot}")
+            print(f"  point_clouds_loss: {(point_clouds_loss/target_transl.shape[0]).item()}")
+            print(f"  pose_loss: {pose_loss.item() if torch.is_tensor(pose_loss) else pose_loss}")
+
         self.loss['total_loss'] = total_loss
         self.loss['transl_loss'] = loss_transl
         self.loss['rot_loss'] = loss_rot
         self.loss['point_clouds_loss'] = point_clouds_loss/target_transl.shape[0]
 
         return self.loss
-

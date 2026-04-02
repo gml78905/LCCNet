@@ -24,12 +24,14 @@ import torch.optim as optim
 import torch.utils.data
 from torch.utils.data import ConcatDataset
 import torch.nn as nn
+import os.path as osp
 
 from sacred import Experiment
 from sacred.utils import apply_backspaces_and_linefeeds
 
 from DatasetLidarCamera import DatasetLidarCameraKittiOdometry, DatasetLidarCameraHercules
 from DatasetCameraRadar import DatasetCameraRadarHercules
+from DatasetLGInnotek import DatasetLidarCameraLGInnotek, DatasetCameraRadarLGInnotek
 from losses import DistancePoints3D, GeometricLoss, L1Loss, ProposedLoss, CombinedLoss
 from models.LCCNet import LCCNet
 
@@ -39,6 +41,11 @@ from tensorboardX import SummaryWriter
 from utils import (mat2xyzrpy, merge_inputs, overlay_imgs, quat2mat,
                    quaternion_from_matrix, rotate_back, rotate_forward,
                    tvector2mat)
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = False
@@ -54,14 +61,17 @@ ex.captured_out_filter = apply_backspaces_and_linefeeds
 @ex.config
 def config():
     checkpoints = '/workspace/data/checkpoints/LCCNet/'
-    dataset = 'hercules' # 'kitti/odom', 'kitti/raw', 'hercules'
-    sensor_mode = 'lidar'  # For Hercules: 'lidar', 'radar', or 'both'
+    dataset = 'hercules' # 'kitti/odom', 'kitti/raw', 'hercules', 'lg_innotek'
+    sensor_mode = 'lidar'  # For Hercules/LG_Innotek: 'lidar', 'radar', or 'both'
     data_folder = '/workspace/data/hercules'
     use_reflectance = False
     val_sequence = 0  # For KITTI
     val_scene = ['library_1']  # For Hercules (None = use first scene, list = use multiple scenes)
     train_scene = ['SC_1', 'SC_3', 'island_1']  # For Hercules (None = use all scenes except val_scene, list = use specific scenes for training)
     checkpoint_name = 'test'  # For Hercules: custom checkpoint name for saving (None = auto-generate from val_scene and sensor_mode)
+    lg_train_scene = ['afternoon_parking_lot_1', 'afternoon_campus_1']
+    lg_val_scene = ['afternoon_campus_2']
+    lg_val_frame_limit = 3000
     epochs = 120
     BASE_LEARNING_RATE = 1e-4  # 1e-4
     loss = 'combined'
@@ -83,10 +93,19 @@ def config():
     log_frequency = 10
     print_frequency = 50
     starting_epoch = -1
+    wandb_enabled = False
+    wandb_project = 'LCCNet'
+    wandb_entity = 'LGIT_calib'
+    wandb_name = 'Test'
+    wandb_mode = 'online'  # 'online', 'offline', 'disabled'
+    wandb_log_images = True
+    debug_timing = False
+    use_dataparallel = True
 
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
 EPOCH = 1
@@ -127,37 +146,157 @@ def lidar_project_depth(pc_rotated, cam_calib, img_shape):
     return depth_img, pcl_uv
 
 
+def _resize_tensor_chw(tensor, size, mode="bilinear"):
+    align_corners = False if mode in ["bilinear", "bicubic"] else None
+    tensor = tensor.unsqueeze(0)
+    if align_corners is None:
+        tensor = F.interpolate(tensor, size=size, mode=mode)
+    else:
+        tensor = F.interpolate(tensor, size=size, mode=mode, align_corners=align_corners)
+    return tensor.squeeze(0)
+
+
+def preprocess_projected_inputs(rgb, depth_img, depth_gt, img_shape, input_size):
+    target_h, target_w = img_shape
+    src_h, src_w = rgb.shape[1], rgb.shape[2]
+
+    # Keep the full frame visible: shrink oversized inputs to fit the canvas
+    # before padding, instead of relying on negative padding which crops the
+    # right/bottom region and leaves only the top-left content.
+    resize_scale = min(target_h / src_h, target_w / src_w, 1.0)
+    if resize_scale < 1.0:
+        resized_h = max(1, int(round(src_h * resize_scale)))
+        resized_w = max(1, int(round(src_w * resize_scale)))
+        resize_size = (resized_h, resized_w)
+        rgb = _resize_tensor_chw(rgb, resize_size, mode="bilinear")
+        depth_img = _resize_tensor_chw(depth_img, resize_size, mode="bilinear")
+        depth_gt = _resize_tensor_chw(depth_gt, resize_size, mode="bilinear")
+
+    shape_pad = [0, 0, 0, 0]
+    shape_pad[3] = target_h - rgb.shape[1]
+    shape_pad[1] = target_w - rgb.shape[2]
+
+    rgb = F.pad(rgb, shape_pad)
+    depth_img = F.pad(depth_img, shape_pad)
+    depth_gt = F.pad(depth_gt, shape_pad)
+
+    return rgb, depth_img, depth_gt, shape_pad
+
+
+def fit_tensor_to_canvas(tensor, img_shape):
+    target_h, target_w = img_shape
+    src_h, src_w = tensor.shape[1], tensor.shape[2]
+
+    resize_scale = min(target_h / src_h, target_w / src_w, 1.0)
+    if resize_scale < 1.0:
+        resized_h = max(1, int(round(src_h * resize_scale)))
+        resized_w = max(1, int(round(src_w * resize_scale)))
+        tensor = _resize_tensor_chw(tensor, (resized_h, resized_w), mode="bilinear")
+
+    shape_pad = [0, 0, 0, 0]
+    shape_pad[3] = target_h - tensor.shape[1]
+    shape_pad[1] = target_w - tensor.shape[2]
+    tensor = F.pad(tensor, shape_pad)
+    return tensor
+
+
+def resize_model_inputs(rgb_batch, lidar_batch, input_size):
+    rgb_batch = F.interpolate(rgb_batch, size=input_size, mode="bilinear")
+    lidar_batch = F.interpolate(lidar_batch, size=input_size, mode="bilinear")
+    return rgb_batch, lidar_batch
+
+
+def _tensor_to_wandb_image(tensor):
+    if isinstance(tensor, torch.Tensor):
+        array = tensor.detach().cpu()
+        if array.dim() == 3:
+            array = array.permute(1, 2, 0).numpy()
+        else:
+            array = array.numpy()
+    else:
+        array = tensor
+    return wandb.Image(array)
+
+
+def _wandb_log(enabled, data, step=None, commit=None):
+    if enabled and wandb is not None and wandb.run is not None:
+        if commit is None:
+            wandb.log(data)
+        else:
+            wandb.log(data, commit=commit)
+
+
 # CCN training
 @ex.capture
-def train(model, optimizer, rgb_img, refl_img, target_transl, target_rot, loss_fn, point_clouds, loss):
+def train(model, optimizer, rgb_img, refl_img, target_transl, target_rot, loss_fn, point_clouds, loss,
+          debug_batch_idx=None, debug_timing=False):
     model.train()
 
     optimizer.zero_grad()
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        print(f"[TrainFn] Batch {debug_batch_idx}: entering model forward")
+        torch.cuda.synchronize()
+        stage_start = time.time()
 
     # Run model
     transl_err, rot_err = model(rgb_img, refl_img)
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        torch.cuda.synchronize()
+        forward_time = time.time() - stage_start
+        print(f"[TrainFn] Batch {debug_batch_idx}: model forward done")
     
     # Check for NaN in model outputs
     if torch.isnan(transl_err).any() or torch.isnan(rot_err).any():
         print("Warning: NaN detected in model outputs")
         return {'total_loss': torch.tensor(0.0, device=rgb_img.device, requires_grad=True)}, rot_err, transl_err
 
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        print(f"[TrainFn] Batch {debug_batch_idx}: entering loss computation")
+        torch.cuda.synchronize()
+        stage_start = time.time()
     if loss == 'points_distance' or loss == 'combined':
         losses = loss_fn(point_clouds, target_transl, target_rot, transl_err, rot_err)
     else:
         losses = loss_fn(target_transl, target_rot, transl_err, rot_err)
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        torch.cuda.synchronize()
+        loss_time = time.time() - stage_start
+        print(f"[TrainFn] Batch {debug_batch_idx}: loss computation done")
     
     # Check for NaN in loss before backward
     if torch.isnan(losses['total_loss']):
         print("Warning: NaN detected in loss, skipping backward")
         return losses, rot_err, transl_err
 
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        print(f"[TrainFn] Batch {debug_batch_idx}: entering backward")
+        torch.cuda.synchronize()
+        stage_start = time.time()
     losses['total_loss'].backward()
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        torch.cuda.synchronize()
+        backward_time = time.time() - stage_start
+        print(f"[TrainFn] Batch {debug_batch_idx}: backward done")
     
     # Gradient clipping to prevent NaN
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        print(f"[TrainFn] Batch {debug_batch_idx}: optimizer step")
+        torch.cuda.synchronize()
+        stage_start = time.time()
     optimizer.step()
+    if debug_timing and debug_batch_idx is not None and debug_batch_idx < 3:
+        torch.cuda.synchronize()
+        optimizer_time = time.time() - stage_start
+        print(f"[TrainFn] Batch {debug_batch_idx}: optimizer done")
+        print(
+            f"[TrainFn] Batch {debug_batch_idx}: timings "
+            f"forward={forward_time:.2f}s, "
+            f"loss={loss_time:.2f}s, "
+            f"backward={backward_time:.2f}s, "
+            f"optimizer={optimizer_time:.2f}s"
+        )
 
     return losses, rot_err, transl_err
 
@@ -204,17 +343,25 @@ def main(_config, _run, seed):
     global EPOCH
     print('Loss Function Choice: {}'.format(_config['loss']))
 
-    if _config['dataset'] == 'hercules':
+    if _config['dataset'] in ['hercules', 'lg_innotek']:
         sensor_mode = _config.get('sensor_mode', 'radar').lower()  # Default to 'radar' for backward compatibility
         if sensor_mode not in ['lidar', 'radar', 'both']:
             raise ValueError(f"Invalid sensor_mode: {sensor_mode}. Must be 'lidar', 'radar', or 'both'")
-        
+
+        dataset_label = 'Hercules' if _config['dataset'] == 'hercules' else 'LG_Innotek'
         if sensor_mode == 'both':
-            print(f"Using Hercules Camera-LIDAR and Camera-RADAR datasets (both)")
+            print(f"Using {dataset_label} Camera-LIDAR and Camera-RADAR datasets (both)")
         else:
-            print(f"Using Hercules Camera-{sensor_mode.upper()} dataset")
-        val_scene = _config['val_scene']
-        if val_scene is None:
+            print(f"Using {dataset_label} Camera-{sensor_mode.upper()} dataset")
+
+        if _config['dataset'] == 'hercules':
+            val_scene = _config['val_scene']
+            train_scene = _config.get('train_scene')
+        else:
+            val_scene = _config.get('lg_val_scene', ['afternoon_campus_2'])
+            train_scene = _config.get('lg_train_scene', ['afternoon_parking_lot_1', 'afternoon_campus_1'])
+
+        if _config['dataset'] == 'hercules' and val_scene is None:
             # Get all scene directories
             scene_list = [d for d in os.listdir(_config['data_folder']) 
                          if os.path.isdir(os.path.join(_config['data_folder'], d))]
@@ -243,7 +390,6 @@ def main(_config, _run, seed):
         if isinstance(val_scene, str):
             val_scene = [val_scene]
         
-        train_scene = _config.get('train_scene')
         if train_scene is not None:
             if isinstance(train_scene, str):
                 train_scene = [train_scene]
@@ -262,13 +408,16 @@ def main(_config, _run, seed):
         
         # Select dataset class(es) based on sensor mode
         if sensor_mode == 'lidar':
-            dataset_class = DatasetLidarCameraHercules
+            dataset_class = DatasetLidarCameraHercules if _config['dataset'] == 'hercules' else DatasetLidarCameraLGInnotek
             dataset_class_val = None  # Same as train
         elif sensor_mode == 'radar':
-            dataset_class = DatasetCameraRadarHercules
+            dataset_class = DatasetCameraRadarHercules if _config['dataset'] == 'hercules' else DatasetCameraRadarLGInnotek
             dataset_class_val = None  # Same as train
         else:  # both
-            dataset_class = [DatasetLidarCameraHercules, DatasetCameraRadarHercules]
+            if _config['dataset'] == 'hercules':
+                dataset_class = [DatasetLidarCameraHercules, DatasetCameraRadarHercules]
+            else:
+                dataset_class = [DatasetLidarCameraLGInnotek, DatasetCameraRadarLGInnotek]
             dataset_class_val = None  # Same as train
     else:
         val_sequence = _config['val_sequence']
@@ -284,35 +433,43 @@ def main(_config, _run, seed):
                 dataset_class = DatasetLidarCameraKittiRaw
             else:
                 raise ValueError(f"Unknown dataset: {_config['dataset']}")
-    img_shape = (384, 1280) # 网络的输入尺度
-    input_size = (256, 512)
+    img_shape = (720, 1280)
+    input_size = (288, 512)
     checkpoints_dir = os.path.join(_config["checkpoints"], _config['dataset'])
 
-    if _config['dataset'] == 'hercules':
+    if _config['dataset'] in ['hercules', 'lg_innotek']:
         if sensor_mode == 'both':
             # Create both lidar and radar datasets
-            dataset_train_lidar = DatasetLidarCameraHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                                             split='train', use_reflectance=_config['use_reflectance'],
-                                                             val_scene=val_scene, train_scene=train_scene)
-            dataset_train_radar = DatasetCameraRadarHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                                             split='train', use_reflectance=_config['use_reflectance'],
-                                                             val_scene=val_scene, train_scene=train_scene)
+            common_kwargs = {}
+            if _config['dataset'] == 'lg_innotek':
+                common_kwargs['val_frame_limit'] = _config.get('lg_val_frame_limit', 3000)
+
+            dataset_train_lidar = dataset_class[0](_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                   split='train', use_reflectance=_config['use_reflectance'],
+                                                   val_scene=val_scene, train_scene=train_scene, **common_kwargs)
+            dataset_train_radar = dataset_class[1](_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                   split='train', use_reflectance=_config['use_reflectance'],
+                                                   val_scene=val_scene, train_scene=train_scene, **common_kwargs)
             dataset_train = ConcatDataset([dataset_train_lidar, dataset_train_radar])
             
-            dataset_val_lidar = DatasetLidarCameraHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                                          split='val', use_reflectance=_config['use_reflectance'],
-                                                          val_scene=val_scene)
-            dataset_val_radar = DatasetCameraRadarHercules(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
-                                                          split='val', use_reflectance=_config['use_reflectance'],
-                                                          val_scene=val_scene)
+            dataset_val_lidar = dataset_class[0](_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                 split='val', use_reflectance=_config['use_reflectance'],
+                                                 val_scene=val_scene, train_scene=train_scene, **common_kwargs)
+            dataset_val_radar = dataset_class[1](_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                                 split='val', use_reflectance=_config['use_reflectance'],
+                                                 val_scene=val_scene, train_scene=train_scene, **common_kwargs)
             dataset_val = ConcatDataset([dataset_val_lidar, dataset_val_radar])
         else:
+            common_kwargs = {}
+            if _config['dataset'] == 'lg_innotek':
+                common_kwargs['val_frame_limit'] = _config.get('lg_val_frame_limit', 3000)
+
             dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
                                           split='train', use_reflectance=_config['use_reflectance'],
-                                          val_scene=val_scene, train_scene=train_scene)
+                                          val_scene=val_scene, train_scene=train_scene, **common_kwargs)
             dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
                                         split='val', use_reflectance=_config['use_reflectance'],
-                                        val_scene=val_scene)
+                                        val_scene=val_scene, train_scene=train_scene, **common_kwargs)
     else:
         dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
                                       split='train', use_reflectance=_config['use_reflectance'],
@@ -320,7 +477,7 @@ def main(_config, _run, seed):
         dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
                                     split='val', use_reflectance=_config['use_reflectance'],
                                     val_sequence=val_sequence)
-    if _config['dataset'] == 'hercules':
+    if _config['dataset'] in ['hercules', 'lg_innotek']:
         # Use checkpoint_name from config if provided, otherwise auto-generate
         if _config.get('checkpoint_name') is not None:
             checkpoint_name = _config['checkpoint_name']
@@ -335,7 +492,7 @@ def main(_config, _run, seed):
         model_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'models')
     if not os.path.exists(model_savepath):
         os.makedirs(model_savepath)
-    if _config['dataset'] == 'hercules':
+    if _config['dataset'] in ['hercules', 'lg_innotek']:
         # Use the same checkpoint_name for log path
         log_savepath = os.path.join(checkpoints_dir, checkpoint_name, 'log')
     else:
@@ -344,6 +501,32 @@ def main(_config, _run, seed):
         os.makedirs(log_savepath)
     train_writer = SummaryWriter(os.path.join(log_savepath, 'train'))
     val_writer = SummaryWriter(os.path.join(log_savepath, 'val'))
+
+    wandb_enabled = bool(_config.get('wandb_enabled', False))
+    if wandb_enabled and wandb is None:
+        print("Warning: wandb is not installed. Disabling wandb logging.")
+        wandb_enabled = False
+    if wandb_enabled:
+        wandb_run_name = _config.get('wandb_name', 'Test')
+        wandb.init(
+            project=_config.get('wandb_project', 'LCCNet'),
+            entity=_config.get('wandb_entity', 'LGIT_calib'),
+            name=wandb_run_name,
+            dir=log_savepath,
+            mode=_config.get('wandb_mode', 'online'),
+            config=dict(_config),
+            reinit=True,
+        )
+        if wandb.run is not None:
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("val_iter/step")
+            wandb.define_metric("val_iter/*", step_metric="val_iter/step")
+            wandb.define_metric("epoch")
+            wandb.define_metric("val/*", step_metric="epoch")
+            wandb.define_metric("best/*", step_metric="epoch")
+            wandb.run.summary['checkpoint_dir'] = model_savepath
+            wandb.run.summary['log_dir'] = log_savepath
 
     np.random.seed(seed)
     torch.random.manual_seed(seed)
@@ -436,7 +619,10 @@ def main(_config, _run, seed):
         # model.load_state_dict(new_state_dict)
 
     # model = model.to(device)
-    model = nn.DataParallel(model)
+    use_dataparallel = _config.get('use_dataparallel', True)
+    visible_gpus = [gpu.strip() for gpu in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if gpu.strip() != '']
+    if use_dataparallel and torch.cuda.device_count() > 1 and len(visible_gpus) > 1:
+        model = nn.DataParallel(model)
     model = model.cuda()
 
     print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
@@ -486,13 +672,18 @@ def main(_config, _run, seed):
         else:
             #scheduler.step(epoch%100)
             _run.log_scalar("LR", scheduler.get_lr()[0])
+        current_lr = optimizer.param_groups[0]['lr']
+        _wandb_log(wandb_enabled, {"epoch": epoch, "train/lr": current_lr})
 
 
         ## Training ##
         time_for_50ep = time.time()
+        debug_timing = _config.get('debug_timing', False)
         for batch_idx, sample in enumerate(TrainImgLoader):
             #print(f'batch {batch_idx+1}/{len(TrainImgLoader)}', end='\r')
             start_time = time.time()
+            if debug_timing and batch_idx < 3:
+                print(f"[Train] Batch {batch_idx} fetched: batch_size={len(sample['rgb'])}")
             lidar_input = []
             rgb_input = []
             lidar_gt = []
@@ -531,16 +722,10 @@ def main(_config, _run, seed):
                 depth_img, uv = lidar_project_depth(pc_rotated, sample['calib'][idx], real_shape) # image_shape
                 depth_img /= _config['max_depth']
 
-                # PAD ONLY ON RIGHT AND BOTTOM SIDE
                 rgb = sample['rgb'][idx].cuda()
-                shape_pad = [0, 0, 0, 0]
-
-                shape_pad[3] = (img_shape[0] - rgb.shape[1])  # // 2
-                shape_pad[1] = (img_shape[1] - rgb.shape[2])  # // 2 + 1
-
-                rgb = F.pad(rgb, shape_pad)
-                depth_img = F.pad(depth_img, shape_pad)
-                depth_gt = F.pad(depth_gt, shape_pad)
+                rgb, depth_img, depth_gt, shape_pad = preprocess_projected_inputs(
+                    rgb, depth_img, depth_gt, img_shape, input_size
+                )
 
                 rgb_input.append(rgb)
                 lidar_input.append(depth_img)
@@ -553,12 +738,18 @@ def main(_config, _run, seed):
             rgb_input = torch.stack(rgb_input)
             rgb_show = rgb_input.clone()
             lidar_show = lidar_input.clone()
-            rgb_input = F.interpolate(rgb_input, size=[256, 512], mode="bilinear")
-            lidar_input = F.interpolate(lidar_input, size=[256, 512], mode="bilinear")
+            rgb_input, lidar_input = resize_model_inputs(rgb_input, lidar_input, input_size)
             end_preprocess = time.time()
+            if debug_timing and batch_idx < 3:
+                print(f"[Train] Batch {batch_idx} preprocess done in {end_preprocess - start_preprocess:.2f}s")
+                print(f"[Train] Batch {batch_idx} resize/pad done, starting forward")
             loss, R_predicted,  T_predicted = train(model, optimizer, rgb_input, lidar_input,
                                                    sample['tr_error'], sample['rot_error'],
-                                                   loss_fn, sample['point_cloud'], _config['loss'])
+                                                   loss_fn, sample['point_cloud'], _config['loss'],
+                                                   debug_batch_idx=batch_idx,
+                                                   debug_timing=debug_timing)
+            if debug_timing and batch_idx < 3:
+                print(f"[Train] Batch {batch_idx} forward/backward done in {time.time() - end_preprocess:.2f}s")
 
             for key in loss.keys():
                 if loss[key].item() != loss[key].item():
@@ -578,7 +769,7 @@ def main(_config, _run, seed):
                                                     sample['calib'][show_idx],
                                                     real_shape_input[show_idx]) # or image_shape
                 depth_pred /= _config['max_depth']
-                depth_pred = F.pad(depth_pred, shape_pad_input[show_idx])
+                depth_pred = fit_tensor_to_canvas(depth_pred, img_shape)
 
                 pred_show = overlay_imgs(rgb_show[show_idx], depth_pred.unsqueeze(0))
                 input_show = overlay_imgs(rgb_show[show_idx], lidar_show[show_idx].unsqueeze(0))
@@ -600,17 +791,31 @@ def main(_config, _run, seed):
                 train_writer.add_scalar("Loss_Rotation", loss['rot_loss'].item(), train_iter)
                 if _config['loss'] == 'combined':
                     train_writer.add_scalar("Loss_Point_clouds", loss['point_clouds_loss'].item(), train_iter)
+                wandb_data = {
+                    "train/step": train_iter,
+                    "train/loss_total": loss['total_loss'].item(),
+                    "train/loss_translation": loss['transl_loss'].item(),
+                    "train/loss_rotation": loss['rot_loss'].item(),
+                }
+                if _config['loss'] == 'combined':
+                    wandb_data["train/loss_point_clouds"] = loss['point_clouds_loss'].item()
+                if wandb_enabled and wandb is not None and _config.get('wandb_log_images', True):
+                    wandb_data["train/input_proj_lidar"] = _tensor_to_wandb_image(input_show)
+                    wandb_data["train/gt_proj_lidar"] = _tensor_to_wandb_image(gt_show)
+                    wandb_data["train/pred_proj_lidar"] = _tensor_to_wandb_image(pred_show)
+                _wandb_log(wandb_enabled, wandb_data)
 
             local_loss += loss['total_loss'].item()
 
-            if batch_idx % 50 == 0 and batch_idx != 0:
+            if batch_idx % 10 == 0:
+                avg_loss = local_loss / 10 if batch_idx != 0 else local_loss
 
-                print(f'Iter {batch_idx}/{len(TrainImgLoader)} training loss = {local_loss/50:.3f}, '
+                print(f'Iter {batch_idx}/{len(TrainImgLoader)} training loss = {avg_loss:.3f}, '
                       f'time = {(time.time() - start_time)/lidar_input.shape[0]:.4f}, '
                       #f'time_preprocess = {(end_preprocess-start_preprocess)/lidar_input.shape[0]:.4f}, '
-                      f'time for 50 iter: {time.time()-time_for_50ep:.4f}')
+                      f'time for recent iters: {time.time()-time_for_50ep:.4f}')
                 time_for_50ep = time.time()
-                _run.log_scalar("Loss", local_loss/50, train_iter)
+                _run.log_scalar("Loss", avg_loss, train_iter)
                 local_loss = 0.
             total_train_loss += loss['total_loss'].item() * len(sample['rgb'])
             train_iter += 1
@@ -621,6 +826,11 @@ def main(_config, _run, seed):
         print('Total epoch time = %.2f' % (time.time() - epoch_start_time))
         print("------------------------------------")
         _run.log_scalar("Total training loss", total_train_loss / len(dataset_train), epoch)
+        _wandb_log(wandb_enabled, {
+            "epoch": epoch,
+            "train/epoch_loss": total_train_loss / len(dataset_train),
+            "train/epoch_time_sec": time.time() - epoch_start_time,
+        })
 
         ## Validation ##
         total_val_loss = 0.
@@ -690,16 +900,10 @@ def main(_config, _run, seed):
                 # else:
                 #     depth_img = torch.stack((depth_img, refl_img))
 
-                # PAD ONLY ON RIGHT AND BOTTOM SIDE
                 rgb = sample['rgb'][idx].cuda()
-                shape_pad = [0, 0, 0, 0]
-
-                shape_pad[3] = (img_shape[0] - rgb.shape[1])  # // 2
-                shape_pad[1] = (img_shape[1] - rgb.shape[2])  # // 2 + 1
-
-                rgb = F.pad(rgb, shape_pad)
-                depth_img = F.pad(depth_img, shape_pad)
-                depth_gt = F.pad(depth_gt, shape_pad)
+                rgb, depth_img, depth_gt, shape_pad = preprocess_projected_inputs(
+                    rgb, depth_img, depth_gt, img_shape, input_size
+                )
 
                 rgb_input.append(rgb)
                 lidar_input.append(depth_img)
@@ -712,8 +916,7 @@ def main(_config, _run, seed):
             rgb_input = torch.stack(rgb_input)
             rgb_show = rgb_input.clone()
             lidar_show = lidar_input.clone()
-            rgb_input = F.interpolate(rgb_input, size=[256, 512], mode="bilinear")
-            lidar_input = F.interpolate(lidar_input, size=[256, 512], mode="bilinear")
+            rgb_input, lidar_input = resize_model_inputs(rgb_input, lidar_input, input_size)
 
             loss, trasl_e, rot_e, R_predicted,  T_predicted = val(model, rgb_input, lidar_input,
                                                                   sample['tr_error'], sample['rot_error'],
@@ -737,7 +940,7 @@ def main(_config, _run, seed):
                                                     sample['calib'][show_idx],
                                                     real_shape_input[show_idx]) # or image_shape
                 depth_pred /= _config['max_depth']
-                depth_pred = F.pad(depth_pred, shape_pad_input[show_idx])
+                depth_pred = fit_tensor_to_canvas(depth_pred, img_shape)
 
                 pred_show = overlay_imgs(rgb_show[show_idx], depth_pred.unsqueeze(0))
                 input_show = overlay_imgs(rgb_show[show_idx], lidar_show[show_idx].unsqueeze(0))
@@ -759,14 +962,28 @@ def main(_config, _run, seed):
                 val_writer.add_scalar("Loss_Rotation", loss['rot_loss'].item(), val_iter)
                 if _config['loss'] == 'combined':
                     val_writer.add_scalar("Loss_Point_clouds", loss['point_clouds_loss'].item(), val_iter)
+                wandb_data = {
+                    "val_iter/step": val_iter,
+                    "val_iter/loss_total": loss['total_loss'].item(),
+                    "val_iter/loss_translation": loss['transl_loss'].item(),
+                    "val_iter/loss_rotation": loss['rot_loss'].item(),
+                }
+                if _config['loss'] == 'combined':
+                    wandb_data["val_iter/loss_point_clouds"] = loss['point_clouds_loss'].item()
+                if wandb_enabled and wandb is not None and _config.get('wandb_log_images', True):
+                    wandb_data["val/input_proj_lidar"] = _tensor_to_wandb_image(input_show)
+                    wandb_data["val/gt_proj_lidar"] = _tensor_to_wandb_image(gt_show)
+                    wandb_data["val/pred_proj_lidar"] = _tensor_to_wandb_image(pred_show)
+                _wandb_log(wandb_enabled, wandb_data)
 
 
             total_val_t += trasl_e
             total_val_r += rot_e
             local_loss += loss['total_loss'].item()
 
-            if batch_idx % 50 == 0 and batch_idx != 0:
-                print('Iter %d val loss = %.3f , time = %.2f' % (batch_idx, local_loss/50.,
+            if batch_idx % 10 == 0:
+                avg_loss = local_loss / 10 if batch_idx != 0 else local_loss
+                print('Iter %d val loss = %.3f , time = %.2f' % (batch_idx, avg_loss,
                                                                   (time.time() - start_time)/lidar_input.shape[0]))
                 local_loss = 0.0
             total_val_loss += loss['total_loss'].item() * len(sample['rgb'])
@@ -781,6 +998,12 @@ def main(_config, _run, seed):
         _run.log_scalar("Val_Loss", total_val_loss / len(dataset_val), epoch)
         _run.log_scalar("Val_t_error", total_val_t / len(dataset_val), epoch)
         _run.log_scalar("Val_r_error", total_val_r / len(dataset_val), epoch)
+        _wandb_log(wandb_enabled, {
+            "epoch": epoch,
+            "val/loss": total_val_loss / len(dataset_val),
+            "val/t_error_cm": total_val_t / len(dataset_val),
+            "val/r_error_deg": total_val_r / len(dataset_val),
+        })
 
         # SAVE
         val_loss = total_val_loss / len(dataset_val)
@@ -796,16 +1019,29 @@ def main(_config, _run, seed):
                 'config': _config,
                 'epoch': epoch,
                 # 'state_dict': model.state_dict(), # single gpu
-                'state_dict': model.module.state_dict(), # multi gpu
+                'state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(), # multi gpu
                 'optimizer': optimizer.state_dict(),
                 'train_loss': total_train_loss / len(dataset_train),
                 'val_loss': total_val_loss / len(dataset_val),
             }, savefilename)
             print(f'Model saved as {savefilename}')
+            _wandb_log(wandb_enabled, {
+                "epoch": epoch,
+                "best/val_loss": val_loss,
+                "best/checkpoint_path": savefilename,
+                "best/epoch": epoch,
+            })
+            if wandb_enabled and wandb.run is not None:
+                wandb.run.summary['best_val_loss'] = val_loss
+                wandb.run.summary['best_epoch'] = epoch
+                wandb.run.summary['best_checkpoint_path'] = savefilename
             if old_save_filename is not None:
                 if os.path.exists(old_save_filename):
                     os.remove(old_save_filename)
             old_save_filename = savefilename
 
     print('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
+    if wandb_enabled and wandb is not None and wandb.run is not None:
+        wandb.run.summary['full_training_time_hr'] = (time.time() - start_full_time) / 3600
+        wandb.finish()
     return _run.result

@@ -3,19 +3,24 @@
 # LCCNet Docker 컨테이너 실행 스크립트
 
 # 컨테이너 및 이미지 이름 설정
-CONTAINER_NAME="lccnet_container"
-IMAGE_NAME="lccnet:rtx3080"
+CONTAINER_BASE_NAME="lccnet_container"
+IMAGE_NAME="lccnet:dev"
+WANDB_API_KEY="bcff59c5a31fc6dafe8a756e55bdf583e5e79ca3"
 
 # ------------------------------------------------------------------
 # [GPU 설정 로직]
 # 첫 번째 인자($1)가 없으면 "all", 있으면 "device=$1" 형식으로 설정
 if [ -z "$1" ]; then
     GPU_OPTION="all"
+    GPU_NAME_SUFFIX="all"
     echo "▶ GPU 모드: 모든 GPU 사용 (Default)"
 else
     GPU_OPTION="device=$1"
+    GPU_NAME_SUFFIX="$(echo "$1" | tr ',:' '__')"
     echo "▶ GPU 모드: 지정된 GPU 사용 ($1)"
 fi
+
+CONTAINER_NAME="${CONTAINER_BASE_NAME}_${GPU_NAME_SUFFIX}"
 # ------------------------------------------------------------------
 
 # 현재 디렉토리 경로 (프로젝트 루트)
@@ -24,7 +29,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 데이터 디렉토리 경로
 DATA_DIR="/media/TrainDataset/"
 
-# 기존 컨테이너가 실행 중이면 중지 및 제거
+# 같은 GPU suffix를 가진 기존 컨테이너가 실행 중이면 중지 및 제거
 if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
     echo "기존 컨테이너를 중지하고 제거합니다..."
     docker stop $CONTAINER_NAME > /dev/null
@@ -42,6 +47,8 @@ if [ -d "$DATA_DIR" ]; then
     docker run -it --rm \
         --name $CONTAINER_NAME \
         --gpus "$GPU_OPTION" \
+        --shm-size=32g \
+        -e WANDB_API_KEY="$WANDB_API_KEY" \
         -v "$PROJECT_ROOT:/workspace/LCCNet" \
         -v "$DATA_DIR:/workspace/data" \
         -w /workspace/LCCNet \
@@ -53,6 +60,8 @@ else
     docker run -it --rm \
         --name $CONTAINER_NAME \
         --gpus "$GPU_OPTION" \
+        --shm-size=32g \
+        -e WANDB_API_KEY="$WANDB_API_KEY" \
         -v "$PROJECT_ROOT:/workspace/LCCNet" \
         -w /workspace/LCCNet \
         $IMAGE_NAME \

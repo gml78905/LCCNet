@@ -8,4 +8,4 @@ echo "Docker 이미지를 빌드합니다..."
 echo "빌드 컨텍스트: $SCRIPT_DIR"
 echo "Dockerfile: docker/Dockerfile"
 
-docker build -f docker/Dockerfile -t lccnet:rtx3080 .
+docker build -f docker/Dockerfile -t lccnet:dev .

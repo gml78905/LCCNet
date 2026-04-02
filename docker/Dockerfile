@@ -32,7 +32,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir trimesh
+    pip install --no-cache-dir trimesh && \
+    python -c "import wandb"
 
 # 6. 기본 쉘 설정
 CMD ["/bin/bash"]

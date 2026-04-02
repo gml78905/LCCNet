@@ -365,7 +365,9 @@ class LCCNet(nn.Module):
             self.dc_conv7 = predict_flow(32)
 
         fc_size = od + dd[4]
-        downsample = 128 // (2**use_feat_from)
+        # The final correlation feature map is downsampled by 32 at the coarsest
+        # level, then doubles in resolution as we use finer features.
+        downsample = max(2, 64 // (2**use_feat_from))
         if image_size[0] % downsample == 0:
             fc_size *= image_size[0] // downsample
         else:
@@ -374,7 +376,7 @@ class LCCNet(nn.Module):
             fc_size *= image_size[1] // downsample
         else:
             fc_size *= (image_size[1] // downsample)+1
-        self.fc1 = nn.Linear(fc_size * 4, 512)
+        self.fc1 = nn.Linear(fc_size, 512)
 
         self.fc1_trasl = nn.Linear(512, 256)
         self.fc1_rot = nn.Linear(512, 256)
@@ -582,5 +584,3 @@ class LCCNet(nn.Module):
         rot = F.normalize(rot, dim=1)
 
         return transl, rot
-
-

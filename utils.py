@@ -192,7 +192,12 @@ def quatmultiply(q, r):
     t[1] = r[0] * q[1] + r[1] * q[0] - r[2] * q[3] + r[3] * q[2]
     t[2] = r[0] * q[2] + r[1] * q[3] + r[2] * q[0] - r[3] * q[1]
     t[3] = r[0] * q[3] - r[1] * q[2] + r[2] * q[1] + r[3] * q[0]
-    return t / t.norm()
+    t_norm = t.norm()
+    if t_norm < 1e-12:
+        identity = torch.zeros(4, device=q.device, dtype=q.dtype)
+        identity[0] = 1.
+        return identity
+    return t / t_norm
 
 
 def quat2mat(q):
@@ -205,8 +210,12 @@ def quat2mat(q):
         torch.Tensor: [4x4] homogeneous rotation matrix
     """
     assert q.shape == torch.Size([4]), "Not a valid quaternion"
-    if q.norm() != 1.:
-        q = q / q.norm()
+    q_norm = q.norm()
+    if q_norm < 1e-12:
+        mat = torch.eye(4, device=q.device, dtype=q.dtype)
+        return mat
+    if not torch.isclose(q_norm, torch.tensor(1.0, device=q.device, dtype=q.dtype), atol=1e-6):
+        q = q / q_norm
     mat = torch.zeros((4, 4), device=q.device)
     mat[0, 0] = 1 - 2*q[2]**2 - 2*q[3]**2
     mat[0, 1] = 2*q[1]*q[2] - 2*q[3]*q[0]

@@ -14,3 +14,4 @@ tensorboardX
 open3d
 Pillow
 sacred
+wandb
