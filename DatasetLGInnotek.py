@@ -3,17 +3,21 @@ import os
 import re
 
 import cv2
-import mathutils
+try:
+    import mathutils
+except ImportError:
+    mathutils = None
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TTF
 import yaml
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from utils import invert_pose
+from utils import invert_pose, quaternion_from_matrix
 
 import open3d as o3d
 
@@ -96,6 +100,36 @@ def _compute_rectified_intrinsic(K, distortion, image_size):
         (width, height),
     )
     return rectified_K.astype(np.float32)
+
+
+def _euler_xyz_to_matrix(rotx, roty, rotz):
+    cx, sx = np.cos(rotx), np.sin(rotx)
+    cy, sy = np.cos(roty), np.sin(roty)
+    cz, sz = np.cos(rotz), np.sin(rotz)
+
+    Rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, cx, -sx],
+        [0.0, sx, cx],
+    ], dtype=np.float32)
+    Ry = np.array([
+        [cy, 0.0, sy],
+        [0.0, 1.0, 0.0],
+        [-sy, 0.0, cy],
+    ], dtype=np.float32)
+    Rz = np.array([
+        [cz, -sz, 0.0],
+        [sz, cz, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    return (Rx @ Ry @ Rz).astype(np.float32)
+
+
+def _build_transform(tx, ty, tz, rotx, roty, rotz):
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = _euler_xyz_to_matrix(rotx, roty, rotz)
+    T[:3, 3] = np.array([tx, ty, tz], dtype=np.float32)
+    return T
 
 
 def _load_extrinsic_matrix(extrinsic_path, sensor_mode):
@@ -215,6 +249,48 @@ def _load_pairs(pair_file, image_dir, sensor_dir, split, val_frame_limit=None):
     if split in ['val', 'test'] and val_frame_limit is not None:
         pairs = pairs[:val_frame_limit]
     return pairs
+
+
+def _load_triplets(pair_file, image_dir, lidar_dir, radar_dir, split, val_frame_limit=None):
+    image_map = _index_files(image_dir)
+    lidar_map = _index_files(lidar_dir)
+    radar_map = _index_files(radar_dir)
+    triplets = []
+
+    with open(pair_file, 'r') as f:
+        for line_idx, line in enumerate(f):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            tokens = re.split(r'[\s,]+', line)
+            if len(tokens) < 3:
+                continue
+
+            # Skip header rows if present.
+            if line_idx == 0 and (not tokens[0].isdigit() or not tokens[1].isdigit() or not tokens[2].isdigit()):
+                continue
+            if not tokens[0].isdigit() or not tokens[1].isdigit() or not tokens[2].isdigit():
+                continue
+
+            cam_token, lidar_token, radar_token = tokens[0], tokens[1], tokens[2]
+            image_path = _match_path(image_map, cam_token)
+            lidar_path = _match_path(lidar_map, lidar_token)
+            radar_path = _match_path(radar_map, radar_token)
+            if image_path is None or lidar_path is None or radar_path is None:
+                continue
+
+            triplets.append({
+                'stamp': cam_token,
+                'image_path': image_path,
+                'lidar_path': lidar_path,
+                'radar_path': radar_path,
+                'image_name': os.path.basename(image_path),
+            })
+
+    if split in ['val', 'test'] and val_frame_limit is not None:
+        triplets = triplets[:val_frame_limit]
+    return triplets
 
 
 def _load_point_cloud(file_path, pcd_reader):
@@ -444,6 +520,8 @@ class _DatasetLGInnotekBase(Dataset):
             transl_y = initial_rt[2]
             transl_z = initial_rt[3]
 
+        if mathutils is None:
+            raise ImportError("mathutils is required for DatasetLGInnotek pair-mode datasets.")
         R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
         T = mathutils.Vector((transl_x, transl_y, transl_z))
         R, T = invert_pose(R, T)
@@ -474,3 +552,240 @@ class DatasetCameraRadarLGInnotek(_DatasetLGInnotekBase):
     sensor_folder = 'radar_Continental'
     pair_filename = 'image_Cam0_radar_Continental.txt'
     extrinsic_mode = 'radar'
+
+
+class DatasetTriModalLGInnotek(Dataset):
+    """
+    Minimal tri-modal dataset contract for baseline tri-modal calibration.
+    Returns:
+      rgb, lidar_proj, radar_proj,
+      T_CL_t_gt, T_CL_q_gt,
+      T_CR_t_gt, T_CR_q_gt,
+      T_LR_t_gt, T_LR_q_gt
+    """
+
+    pair_filename = 'image_Cam0_lidar_Hesai_radar_Continental.txt'
+
+    def __init__(self, dataset_dir, transform=None, augmentation=False, use_reflectance=False,
+                 max_t=1.5, max_r=20., split='val', device='cpu', train_scene=None,
+                 val_scene=None, val_frame_limit=None, suf='.png', input_size=(288, 512), max_depth=80.0):
+        super().__init__()
+        self.use_reflectance = use_reflectance
+        self.device = device
+        self.max_r = max_r
+        self.max_t = max_t
+        self.augmentation = augmentation
+        self.root_dir = dataset_dir
+        self.transform = transform
+        self.split = split
+        self.suf = suf
+        self.train_scene = train_scene or []
+        self.val_scene = val_scene or []
+        self.val_frame_limit = val_frame_limit
+        self.input_size = input_size
+        self.max_depth = float(max_depth)
+
+        intrinsic_path = os.path.join(dataset_dir, 'intrinsic.txt')
+        extrinsic_path = os.path.join(dataset_dir, 'lg_init_extrinsics.yaml')
+        self.K_raw, self.distortion = _load_intrinsic_file(intrinsic_path)
+        self.K_raw = _scale_intrinsic_half(self.K_raw)
+        self.T_cam_lidar = _load_extrinsic_matrix(extrinsic_path, 'lidar').astype(np.float32)
+        self.T_cam_radar = _load_extrinsic_matrix(extrinsic_path, 'radar').astype(np.float32)
+        self.T_lidar_radar = np.linalg.inv(self.T_cam_lidar) @ self.T_cam_radar
+
+        self.pcd_reader = ReadOpen3d()
+        self.all_files = []
+        self.val_RT_lidar = []
+        self.val_RT_radar = []
+
+        if split == 'train':
+            selected_scenes = self.train_scene
+        else:
+            selected_scenes = self.val_scene
+
+        for scene in selected_scenes:
+            scene_root = os.path.join(dataset_dir, scene, 'offline', 'sensor_data')
+            image_dir = os.path.join(scene_root, 'image_Cam0')
+            lidar_dir = os.path.join(scene_root, 'lidar_Hesai')
+            radar_dir = os.path.join(scene_root, 'radar_Continental')
+            pair_file = os.path.join(dataset_dir, scene, 'offline', 'synced_stamps', self.pair_filename)
+            if not os.path.exists(pair_file):
+                raise FileNotFoundError(f"Triplet pair file not found: {pair_file}")
+
+            frame_limit = self.val_frame_limit if split in ['val', 'test'] else None
+            scene_triplets = _load_triplets(pair_file, image_dir, lidar_dir, radar_dir, split, frame_limit)
+            for triplet in scene_triplets:
+                triplet['scene'] = scene
+                self.all_files.append(triplet)
+
+        self._init_val_perturbations()
+
+    def __len__(self):
+        return len(self.all_files)
+
+    def _sample_pose_error(self, rng=None):
+        if rng is None:
+            uniform = np.random.uniform
+        else:
+            uniform = rng.uniform
+        rotz = uniform(-self.max_r, self.max_r) * (np.pi / 180.0)
+        roty = uniform(-self.max_r, self.max_r) * (np.pi / 180.0)
+        rotx = uniform(-self.max_r, self.max_r) * (np.pi / 180.0)
+        tx = uniform(-self.max_t, self.max_t)
+        ty = uniform(-self.max_t, self.max_t)
+        tz = uniform(-self.max_t, self.max_t)
+        return tx, ty, tz, rotx, roty, rotz
+
+    def _init_val_perturbations(self):
+        if self.split not in ['val', 'test']:
+            return
+        lidar_rng = np.random.RandomState(0)
+        radar_rng = np.random.RandomState(1)
+        for _ in range(len(self.all_files)):
+            self.val_RT_lidar.append(self._sample_pose_error(lidar_rng))
+            self.val_RT_radar.append(self._sample_pose_error(radar_rng))
+
+    def custom_transform(self, rgb, img_rotation=0., flip=False):
+        to_tensor = transforms.ToTensor()
+        normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+
+        if self.split == 'train':
+            color_transform = transforms.ColorJitter(0.1, 0.1, 0.1)
+            rgb = color_transform(rgb)
+            if flip:
+                rgb = TTF.hflip(rgb)
+            rgb = TTF.rotate(rgb, img_rotation)
+
+        rgb = to_tensor(rgb)
+        rgb = normalization(rgb)
+        return rgb
+
+    def _load_image(self, image_path):
+        try:
+            with Image.open(image_path) as image:
+                image_rgb = image.convert('RGB')
+                image_rgb = np.array(image_rgb)
+        except (OSError, ValueError):
+            raise OSError(f"Image not found or unreadable: {image_path}")
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+        height, width = image_bgr.shape[:2]
+        if self.distortion.size > 0:
+            calib = _compute_rectified_intrinsic(self.K_raw, self.distortion, (width, height))
+            image_bgr = cv2.undistort(image_bgr, self.K_raw, self.distortion, None, calib)
+        else:
+            calib = self.K_raw.copy()
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(image_rgb), calib
+
+    def _project_to_image(self, pc_sensor, T_cam_sensor, calib, image_hw):
+        if pc_sensor.shape[0] == 0:
+            h, w = image_hw
+            return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.float32)
+
+        xyz1 = np.ones((pc_sensor.shape[0], 4), dtype=np.float32)
+        xyz1[:, :3] = pc_sensor[:, :3]
+        pc_cam = (T_cam_sensor @ xyz1.T).T
+
+        x = pc_cam[:, 0]
+        y = pc_cam[:, 1]
+        z = pc_cam[:, 2]
+        aux = pc_sensor[:, 3] if pc_sensor.shape[1] > 3 else np.zeros_like(z)
+        h, w = image_hw
+
+        valid = z > 1e-5
+        valid = valid & (z < self.max_depth)
+        if not np.any(valid):
+            return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.float32)
+
+        x = x[valid]
+        y = y[valid]
+        z = z[valid]
+        aux = aux[valid]
+
+        u = (calib[0, 0] * x / z) + calib[0, 2]
+        v = (calib[1, 1] * y / z) + calib[1, 2]
+
+        u = np.round(u).astype(np.int32)
+        v = np.round(v).astype(np.int32)
+        in_img = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        if not np.any(in_img):
+            return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.float32)
+
+        u = u[in_img]
+        v = v[in_img]
+        z = z[in_img]
+        aux = aux[in_img]
+
+        depth = np.zeros((h, w), dtype=np.float32)
+        aux_map = np.zeros((h, w), dtype=np.float32)
+        depth[v, u] = z
+        aux_map[v, u] = aux
+        depth /= self.max_depth
+        return depth, aux_map
+
+    @staticmethod
+    def _matrix_to_t_q(T):
+        T_torch = torch.from_numpy(T.astype(np.float32))
+        t = T_torch[:3, 3].clone()
+        q = quaternion_from_matrix(T_torch)
+        return t, q
+
+    def __getitem__(self, idx):
+        item = self.all_files[idx]
+        image_path = item['image_path']
+        lidar_path = item['lidar_path']
+        radar_path = item['radar_path']
+
+        try:
+            img, calib = self._load_image(image_path)
+        except OSError:
+            new_idx = np.random.randint(0, self.__len__())
+            return self.__getitem__(new_idx)
+
+        rgb = self.custom_transform(img, img_rotation=0., flip=False)
+        rgb = F.interpolate(rgb.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+
+        lidar_pc = _load_point_cloud(lidar_path, self.pcd_reader)
+        radar_pc = _load_point_cloud(radar_path, self.pcd_reader)
+        image_hw = (img.height, img.width)
+
+        if self.split == 'train':
+            lidar_rt = self._sample_pose_error()
+            radar_rt = self._sample_pose_error()
+        else:
+            lidar_rt = self.val_RT_lidar[idx]
+            radar_rt = self.val_RT_radar[idx]
+
+        T_err_lidar = _build_transform(*lidar_rt)
+        T_err_radar = _build_transform(*radar_rt)
+        T_cam_lidar_input = (T_err_lidar @ self.T_cam_lidar).astype(np.float32)
+        T_cam_radar_input = (T_err_radar @ self.T_cam_radar).astype(np.float32)
+
+        lidar_depth, _ = self._project_to_image(lidar_pc, T_cam_lidar_input, calib, image_hw)
+        radar_depth, radar_aux = self._project_to_image(radar_pc, T_cam_radar_input, calib, image_hw)
+
+        lidar_proj = torch.from_numpy(lidar_depth).unsqueeze(0)  # [1, H, W]
+        radar_proj = torch.from_numpy(np.stack([radar_depth, radar_aux], axis=0))  # [2, H, W]
+        lidar_proj = F.interpolate(lidar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+        radar_proj = F.interpolate(radar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+
+        T_CL_t_gt, T_CL_q_gt = self._matrix_to_t_q(self.T_cam_lidar)
+        T_CR_t_gt, T_CR_q_gt = self._matrix_to_t_q(self.T_cam_radar)
+        T_LR_t_gt, T_LR_q_gt = self._matrix_to_t_q(self.T_lidar_radar)
+
+        return {
+            'rgb': rgb.float(),
+            'lidar_proj': lidar_proj.float(),
+            'radar_proj': radar_proj.float(),
+            'T_CL_t_gt': T_CL_t_gt.float(),
+            'T_CL_q_gt': T_CL_q_gt.float(),
+            'T_CR_t_gt': T_CR_t_gt.float(),
+            'T_CR_q_gt': T_CR_q_gt.float(),
+            'T_LR_t_gt': T_LR_t_gt.float(),
+            'T_LR_q_gt': T_LR_q_gt.float(),
+            'T_CL_input': torch.from_numpy(T_cam_lidar_input),
+            'T_CR_input': torch.from_numpy(T_cam_radar_input),
+        }

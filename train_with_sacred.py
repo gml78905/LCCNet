@@ -15,7 +15,10 @@ import random
 import time
 
 # import apex
-import mathutils
+try:
+    import mathutils
+except ImportError:
+    mathutils = None
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,9 +34,16 @@ from sacred.utils import apply_backspaces_and_linefeeds
 
 from DatasetLidarCamera import DatasetLidarCameraKittiOdometry, DatasetLidarCameraHercules
 from DatasetCameraRadar import DatasetCameraRadarHercules
-from DatasetLGInnotek import DatasetLidarCameraLGInnotek, DatasetCameraRadarLGInnotek
+from DatasetLGInnotek import (
+    DatasetLidarCameraLGInnotek,
+    DatasetCameraRadarLGInnotek,
+    DatasetTriModalLGInnotek,
+    _load_point_cloud,
+)
 from losses import DistancePoints3D, GeometricLoss, L1Loss, ProposedLoss, CombinedLoss
+from losses_tri import TriModalPairwiseLoss
 from models.LCCNet import LCCNet
+from models.tri_calib.model import TriModalCalibNet
 
 from quaternion_distances import quaternion_distance
 
@@ -49,6 +59,7 @@ except ImportError:
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = False
+device = torch.device("cuda")
 
 # Disable git info to avoid errors in Docker containers
 # In Docker, git repository may not work properly, so disable it
@@ -62,7 +73,7 @@ ex.captured_out_filter = apply_backspaces_and_linefeeds
 def config():
     checkpoints = '/workspace/data/checkpoints/LCCNet/'
     dataset = 'hercules' # 'kitti/odom', 'kitti/raw', 'hercules', 'lg_innotek'
-    sensor_mode = 'lidar'  # For Hercules/LG_Innotek: 'lidar', 'radar', or 'both'
+    sensor_mode = 'lidar'  # For Hercules/LG_Innotek: 'lidar', 'radar', 'both', or 'tri'
     data_folder = '/workspace/data/hercules'
     use_reflectance = False
     val_sequence = 0  # For KITTI
@@ -94,13 +105,17 @@ def config():
     print_frequency = 50
     starting_epoch = -1
     wandb_enabled = False
-    wandb_project = 'LCCNet'
+    wandb_project = 'LCCNet_TriModal'
     wandb_entity = 'LGIT_calib'
-    wandb_name = 'Test'
+    wandb_name = 'TriBaseline'
     wandb_mode = 'online'  # 'online', 'offline', 'disabled'
     wandb_log_images = True
     debug_timing = False
     use_dataparallel = True
+    tri_run_one_batch = True
+    tri_debug_shapes = True
+    tri_loss_w_t = 1.0
+    tri_loss_w_q = 1.0
 
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -342,15 +357,19 @@ def val(model, rgb_img, refl_img, target_transl, target_rot, loss_fn, point_clou
 def main(_config, _run, seed):
     global EPOCH
     print('Loss Function Choice: {}'.format(_config['loss']))
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this run, but no GPU is available.")
 
     if _config['dataset'] in ['hercules', 'lg_innotek']:
         sensor_mode = _config.get('sensor_mode', 'radar').lower()  # Default to 'radar' for backward compatibility
-        if sensor_mode not in ['lidar', 'radar', 'both']:
-            raise ValueError(f"Invalid sensor_mode: {sensor_mode}. Must be 'lidar', 'radar', or 'both'")
+        if sensor_mode not in ['lidar', 'radar', 'both', 'tri']:
+            raise ValueError(f"Invalid sensor_mode: {sensor_mode}. Must be 'lidar', 'radar', 'both', or 'tri'")
 
         dataset_label = 'Hercules' if _config['dataset'] == 'hercules' else 'LG_Innotek'
         if sensor_mode == 'both':
             print(f"Using {dataset_label} Camera-LIDAR and Camera-RADAR datasets (both)")
+        elif sensor_mode == 'tri':
+            print(f"Using {dataset_label} tri-modal Camera-LIDAR-RADAR dataset")
         else:
             print(f"Using {dataset_label} Camera-{sensor_mode.upper()} dataset")
 
@@ -413,12 +432,17 @@ def main(_config, _run, seed):
         elif sensor_mode == 'radar':
             dataset_class = DatasetCameraRadarHercules if _config['dataset'] == 'hercules' else DatasetCameraRadarLGInnotek
             dataset_class_val = None  # Same as train
-        else:  # both
+        elif sensor_mode == 'both':
             if _config['dataset'] == 'hercules':
                 dataset_class = [DatasetLidarCameraHercules, DatasetCameraRadarHercules]
             else:
                 dataset_class = [DatasetLidarCameraLGInnotek, DatasetCameraRadarLGInnotek]
             dataset_class_val = None  # Same as train
+        else:  # tri
+            if _config['dataset'] != 'lg_innotek':
+                raise ValueError("tri sensor_mode is currently implemented only for lg_innotek")
+            dataset_class = DatasetTriModalLGInnotek
+            dataset_class_val = None
     else:
         val_sequence = _config['val_sequence']
         if val_sequence is None:
@@ -459,6 +483,18 @@ def main(_config, _run, seed):
                                                  split='val', use_reflectance=_config['use_reflectance'],
                                                  val_scene=val_scene, train_scene=train_scene, **common_kwargs)
             dataset_val = ConcatDataset([dataset_val_lidar, dataset_val_radar])
+        elif sensor_mode == 'tri':
+            common_kwargs = {}
+            if _config['dataset'] == 'lg_innotek':
+                common_kwargs['val_frame_limit'] = _config.get('lg_val_frame_limit', 3000)
+            common_kwargs['input_size'] = input_size
+            common_kwargs['max_depth'] = _config['max_depth']
+            dataset_train = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                          split='train', use_reflectance=_config['use_reflectance'],
+                                          val_scene=val_scene, train_scene=train_scene, **common_kwargs)
+            dataset_val = dataset_class(_config['data_folder'], max_r=_config['max_r'], max_t=_config['max_t'],
+                                        split='val', use_reflectance=_config['use_reflectance'],
+                                        val_scene=val_scene, train_scene=train_scene, **common_kwargs)
         else:
             common_kwargs = {}
             if _config['dataset'] == 'lg_innotek':
@@ -507,9 +543,11 @@ def main(_config, _run, seed):
         print("Warning: wandb is not installed. Disabling wandb logging.")
         wandb_enabled = False
     if wandb_enabled:
-        wandb_run_name = _config.get('wandb_name', 'Test')
+        wandb_run_name = _config.get('wandb_name', 'TriBaseline')
+        if _config.get('network', '').startswith('Tri') and wandb_run_name == 'TriBaseline':
+            wandb_run_name = f"TriBaseline_{_config.get('dataset', 'unknown')}_{_config.get('sensor_mode', 'tri')}"
         wandb.init(
-            project=_config.get('wandb_project', 'LCCNet'),
+            project=_config.get('wandb_project', 'LCCNet_TriModal'),
             entity=_config.get('wandb_entity', 'LGIT_calib'),
             name=wandb_run_name,
             dir=log_savepath,
@@ -563,19 +601,22 @@ def main(_config, _run, seed):
     print(len(ValImgLoader))
 
     # loss function choice
-    if _config['loss'] == 'simple':
-        loss_fn = ProposedLoss(_config['rescale_transl'], _config['rescale_rot'])
-    elif _config['loss'] == 'geometric':
-        loss_fn = GeometricLoss()
-        loss_fn = loss_fn.cuda()
-    elif _config['loss'] == 'points_distance':
-        loss_fn = DistancePoints3D()
-    elif _config['loss'] == 'L1':
-        loss_fn = L1Loss(_config['rescale_transl'], _config['rescale_rot'])
-    elif _config['loss'] == 'combined':
-        loss_fn = CombinedLoss(_config['rescale_transl'], _config['rescale_rot'], _config['weight_point_cloud'])
+    if _config['network'].startswith('Tri'):
+        loss_fn = TriModalPairwiseLoss(_config.get('tri_loss_w_t', 1.0), _config.get('tri_loss_w_q', 1.0))
     else:
-        raise ValueError("Unknown Loss Function")
+        if _config['loss'] == 'simple':
+            loss_fn = ProposedLoss(_config['rescale_transl'], _config['rescale_rot'])
+        elif _config['loss'] == 'geometric':
+            loss_fn = GeometricLoss()
+            loss_fn = loss_fn.to(device)
+        elif _config['loss'] == 'points_distance':
+            loss_fn = DistancePoints3D()
+        elif _config['loss'] == 'L1':
+            loss_fn = L1Loss(_config['rescale_transl'], _config['rescale_rot'])
+        elif _config['loss'] == 'combined':
+            loss_fn = CombinedLoss(_config['rescale_transl'], _config['rescale_rot'], _config['weight_point_cloud'])
+        else:
+            raise ValueError("Unknown Loss Function")
 
     #runs = datetime.now().strftime('%b%d_%H-%M-%S') + "/"
     # train_writer = SummaryWriter('./logs/' + runs)
@@ -597,6 +638,14 @@ def main(_config, _run, seed):
         model = LCCNet(input_size, use_feat_from=feat, md=md,
                          use_reflectance=_config['use_reflectance'], dropout=_config['dropout'],
                          Action_Func='leakyrelu', attention=False, res_num=18)
+    elif _config['network'].startswith('Tri'):
+        model = TriModalCalibNet(
+            camera_pretrained=False,
+            activation='leakyrelu',
+            head_hidden_dim=256,
+            dropout=_config['dropout'],
+            debug_shapes=_config.get('tri_debug_shapes', True),
+        )
     else:
         raise TypeError("Network unknown")
     if _config['weights'] is not None and os.path.exists(_config['weights']):
@@ -621,9 +670,9 @@ def main(_config, _run, seed):
     # model = model.to(device)
     use_dataparallel = _config.get('use_dataparallel', True)
     visible_gpus = [gpu.strip() for gpu in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if gpu.strip() != '']
-    if use_dataparallel and torch.cuda.device_count() > 1 and len(visible_gpus) > 1:
+    if use_dataparallel and torch.cuda.is_available() and torch.cuda.device_count() > 1 and len(visible_gpus) > 1:
         model = nn.DataParallel(model)
-    model = model.cuda()
+    model = model.to(device)
 
     print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -647,6 +696,46 @@ def main(_config, _run, seed):
         if starting_epoch != 0 and 'epoch' in checkpoint:
             starting_epoch = checkpoint['epoch']
 
+    if _config['network'].startswith('Tri') and _config.get('tri_run_one_batch', True):
+        model.train()
+        sample = next(iter(TrainImgLoader))
+        rgb = sample['rgb'].to(device, non_blocking=True)
+        lidar_proj = sample['lidar_proj'].to(device, non_blocking=True)
+        radar_proj = sample['radar_proj'].to(device, non_blocking=True)
+        gt_batch = {
+            'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
+            'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
+            'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
+            'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
+            'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
+            'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
+        }
+        print(f"[Tri Debug] rgb={tuple(rgb.shape)} lidar_proj={tuple(lidar_proj.shape)} radar_proj={tuple(radar_proj.shape)}")
+        assert rgb.ndim == 4 and rgb.shape[1] == 3 and rgb.shape[2] == 288 and rgb.shape[3] == 512
+        assert lidar_proj.ndim == 4 and lidar_proj.shape[1] == 1 and lidar_proj.shape[2] == 288 and lidar_proj.shape[3] == 512
+        assert radar_proj.ndim == 4 and radar_proj.shape[1] == 2 and radar_proj.shape[2] == 288 and radar_proj.shape[3] == 512
+
+        optimizer.zero_grad()
+        pred = model(rgb, lidar_proj, radar_proj)
+        print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
+        print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
+        print(f"[Tri Debug] T_LR_t={tuple(pred['T_LR_t'].shape)} T_LR_q={tuple(pred['T_LR_q'].shape)}")
+        assert pred['T_CL_t'].shape[1] == 3 and pred['T_CL_q'].shape[1] == 4
+        assert pred['T_CR_t'].shape[1] == 3 and pred['T_CR_q'].shape[1] == 4
+        assert pred['T_LR_t'].shape[1] == 3 and pred['T_LR_q'].shape[1] == 4
+
+        losses = loss_fn(pred, gt_batch)
+        print(
+            f"[Tri Debug] total_loss={losses['total_loss'].item():.6f} "
+            f"CL={losses['loss_cl'].item():.6f} "
+            f"CR={losses['loss_cr'].item():.6f} "
+            f"LR={losses['loss_lr'].item():.6f}"
+        )
+        losses['total_loss'].backward()
+        optimizer.step()
+        print("[Tri Debug] one-batch dataset -> model -> loss -> backward succeeded.")
+        return losses['total_loss'].item()
+
     # Allow mixed-precision if needed
     # model, optimizer = apex.amp.initialize(model, optimizer, opt_level=_config["precision"])
 
@@ -657,6 +746,197 @@ def main(_config, _run, seed):
     train_iter = 0
     val_iter = 0
     starting_epoch = 0
+
+    def run_tri_validation(epoch, train_epoch_loss=None):
+        nonlocal BEST_VAL_LOSS, old_save_filename, val_iter
+        model.eval()
+        total_val_loss = 0.0
+        total_input_t_cl = 0.0
+        total_input_t_cr = 0.0
+        total_input_t_lr = 0.0
+        total_input_r_cl = 0.0
+        total_input_r_cr = 0.0
+        total_input_r_lr = 0.0
+        total_val_t_cl = 0.0
+        total_val_t_cr = 0.0
+        total_val_t_lr = 0.0
+        total_val_r_cl = 0.0
+        total_val_r_cr = 0.0
+        total_val_r_lr = 0.0
+
+        def _pose_to_matrix(t_vec, q_vec):
+            T = torch.eye(4, device=t_vec.device, dtype=t_vec.dtype)
+            T[:3, :3] = quat2mat(q_vec)[:3, :3]
+            T[:3, 3] = t_vec
+            return T.detach().cpu().numpy().astype(np.float32)
+
+        def _matrix_batch_to_quaternion(T_batch):
+            quats = [quaternion_from_matrix(T_batch[i]) for i in range(T_batch.shape[0])]
+            return torch.stack(quats, dim=0)
+
+        with torch.no_grad():
+            for batch_idx, sample in enumerate(ValImgLoader):
+                rgb = sample['rgb'].to(device, non_blocking=True)
+                lidar_proj = sample['lidar_proj'].to(device, non_blocking=True)
+                radar_proj = sample['radar_proj'].to(device, non_blocking=True)
+                T_cl_input = sample['T_CL_input'].to(device, non_blocking=True)
+                T_cr_input = sample['T_CR_input'].to(device, non_blocking=True)
+                T_lr_input = torch.linalg.inv(T_cl_input) @ T_cr_input
+                gt_batch = {
+                    'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
+                    'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
+                    'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
+                    'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
+                    'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
+                    'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
+                }
+                input_q_cl = _matrix_batch_to_quaternion(T_cl_input)
+                input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
+                input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
+                pred = model(rgb, lidar_proj, radar_proj)
+                loss = loss_fn(pred, gt_batch)
+                total_val_loss += loss['total_loss'].item() * rgb.shape[0]
+
+                total_input_t_cl += torch.norm(T_cl_input[:, :3, 3] - gt_batch['T_CL_t_gt'], dim=1).sum().item() * 100.0
+                total_input_t_cr += torch.norm(T_cr_input[:, :3, 3] - gt_batch['T_CR_t_gt'], dim=1).sum().item() * 100.0
+                total_input_t_lr += torch.norm(T_lr_input[:, :3, 3] - gt_batch['T_LR_t_gt'], dim=1).sum().item() * 100.0
+                total_input_r_cl += (quaternion_distance(input_q_cl, gt_batch['T_CL_q_gt'], device) * 180.0 / math.pi).sum().item()
+                total_input_r_cr += (quaternion_distance(input_q_cr, gt_batch['T_CR_q_gt'], device) * 180.0 / math.pi).sum().item()
+                total_input_r_lr += (quaternion_distance(input_q_lr, gt_batch['T_LR_q_gt'], device) * 180.0 / math.pi).sum().item()
+
+                total_val_t_cl += torch.norm(pred['T_CL_t'] - gt_batch['T_CL_t_gt'], dim=1).sum().item() * 100.0
+                total_val_t_cr += torch.norm(pred['T_CR_t'] - gt_batch['T_CR_t_gt'], dim=1).sum().item() * 100.0
+                total_val_t_lr += torch.norm(pred['T_LR_t'] - gt_batch['T_LR_t_gt'], dim=1).sum().item() * 100.0
+                total_val_r_cl += (quaternion_distance(pred['T_CL_q'], gt_batch['T_CL_q_gt'], device) * 180.0 / math.pi).sum().item()
+                total_val_r_cr += (quaternion_distance(pred['T_CR_q'], gt_batch['T_CR_q_gt'], device) * 180.0 / math.pi).sum().item()
+                total_val_r_lr += (quaternion_distance(pred['T_LR_q'], gt_batch['T_LR_q_gt'], device) * 180.0 / math.pi).sum().item()
+
+                if batch_idx % _config['log_frequency'] == 0:
+                    print(
+                        f"[Tri Val] Iter {batch_idx}/{len(ValImgLoader)} "
+                        f"loss={loss['total_loss'].item():.4f} "
+                        f"CL={loss['loss_cl'].item():.4f} "
+                        f"CR={loss['loss_cr'].item():.4f} "
+                        f"LR={loss['loss_lr'].item():.4f}"
+                    )
+                    if wandb_enabled and wandb is not None and _config.get('wandb_log_images', True):
+                        show_idx = 0
+                        rgb_show = rgb[show_idx].detach().cpu()
+                        lidar_show = lidar_proj[show_idx].detach().cpu()
+                        radar_show = radar_proj[show_idx].detach().cpu()
+                        radar_vis = radar_show[0:1, :, :]
+                        dataset_show_idx = batch_idx * _config['batch_size'] + show_idx
+                        dataset_item = ValImgLoader.dataset.all_files[dataset_show_idx]
+                        rgb_img, calib = ValImgLoader.dataset._load_image(dataset_item['image_path'])
+                        orig_hw = (rgb_img.height, rgb_img.width)
+                        lidar_pc = _load_point_cloud(dataset_item['lidar_path'], ValImgLoader.dataset.pcd_reader)
+                        radar_pc = _load_point_cloud(dataset_item['radar_path'], ValImgLoader.dataset.pcd_reader)
+
+                        T_cl_pred = _pose_to_matrix(pred['T_CL_t'][show_idx], pred['T_CL_q'][show_idx])
+                        T_cr_pred = _pose_to_matrix(pred['T_CR_t'][show_idx], pred['T_CR_q'][show_idx])
+                        T_lr_pred = _pose_to_matrix(pred['T_LR_t'][show_idx], pred['T_LR_q'][show_idx])
+                        T_cl_gt = _pose_to_matrix(gt_batch['T_CL_t_gt'][show_idx], gt_batch['T_CL_q_gt'][show_idx])
+                        T_cr_gt = _pose_to_matrix(gt_batch['T_CR_t_gt'][show_idx], gt_batch['T_CR_q_gt'][show_idx])
+
+                        lidar_depth_pred, _ = ValImgLoader.dataset._project_to_image(lidar_pc, T_cl_pred, calib, orig_hw)
+                        radar_depth_pred, _ = ValImgLoader.dataset._project_to_image(radar_pc, T_cr_pred, calib, orig_hw)
+                        lidar_depth_gt, _ = ValImgLoader.dataset._project_to_image(lidar_pc, T_cl_gt, calib, orig_hw)
+                        radar_depth_gt, _ = ValImgLoader.dataset._project_to_image(radar_pc, T_cr_gt, calib, orig_hw)
+
+                        lidar_pred_vis = torch.from_numpy(lidar_depth_pred).unsqueeze(0).unsqueeze(0)
+                        lidar_gt_vis = torch.from_numpy(lidar_depth_gt).unsqueeze(0).unsqueeze(0)
+                        radar_pred_vis = torch.from_numpy(radar_depth_pred).unsqueeze(0).unsqueeze(0)
+                        radar_gt_vis = torch.from_numpy(radar_depth_gt).unsqueeze(0).unsqueeze(0)
+                        lidar_pred_vis = F.interpolate(lidar_pred_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
+                        lidar_gt_vis = F.interpolate(lidar_gt_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
+                        radar_pred_vis = F.interpolate(radar_pred_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
+                        radar_gt_vis = F.interpolate(radar_gt_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
+
+                        wandb_data = {
+                            "epoch": epoch,
+                            "val/rgb": _tensor_to_wandb_image(rgb_show),
+                            "val/rgb_lidar_overlay_input": wandb.Image(overlay_imgs(rgb_show, lidar_show.unsqueeze(0))),
+                            "val/rgb_radar_overlay_input": wandb.Image(overlay_imgs(rgb_show, radar_vis.unsqueeze(0))),
+                            "val/rgb_lidar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, lidar_gt_vis)),
+                            "val/rgb_radar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, radar_gt_vis)),
+                            "val/rgb_lidar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, lidar_pred_vis)),
+                            "val/rgb_radar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, radar_pred_vis)),
+                        }
+                        _wandb_log(wandb_enabled, wandb_data)
+
+        val_loss = total_val_loss / len(dataset_val)
+        input_t_cl = total_input_t_cl / len(dataset_val)
+        input_t_cr = total_input_t_cr / len(dataset_val)
+        input_t_lr = total_input_t_lr / len(dataset_val)
+        input_r_cl = total_input_r_cl / len(dataset_val)
+        input_r_cr = total_input_r_cr / len(dataset_val)
+        input_r_lr = total_input_r_lr / len(dataset_val)
+        val_t_cl = total_val_t_cl / len(dataset_val)
+        val_t_cr = total_val_t_cr / len(dataset_val)
+        val_t_lr = total_val_t_lr / len(dataset_val)
+        val_r_cl = total_val_r_cl / len(dataset_val)
+        val_r_cr = total_val_r_cr / len(dataset_val)
+        val_r_lr = total_val_r_lr / len(dataset_val)
+        print("------------------------------------")
+        print(f"total val loss = {val_loss:.3f}")
+        print(f"val input translation cm: CL={input_t_cl:.3f} CR={input_t_cr:.3f} LR={input_t_lr:.3f}")
+        print(f"val input rotation deg:    CL={input_r_cl:.3f} CR={input_r_cr:.3f} LR={input_r_lr:.3f}")
+        print(f"val translation cm: CL={val_t_cl:.3f} CR={val_t_cr:.3f} LR={val_t_lr:.3f}")
+        print(f"val rotation deg:    CL={val_r_cl:.3f} CR={val_r_cr:.3f} LR={val_r_lr:.3f}")
+        print("------------------------------------")
+        _run.log_scalar("Val_Loss", val_loss, epoch)
+        _run.log_scalar("Val_input_t_CL", input_t_cl, epoch)
+        _run.log_scalar("Val_input_t_CR", input_t_cr, epoch)
+        _run.log_scalar("Val_input_t_LR", input_t_lr, epoch)
+        _run.log_scalar("Val_input_r_CL", input_r_cl, epoch)
+        _run.log_scalar("Val_input_r_CR", input_r_cr, epoch)
+        _run.log_scalar("Val_input_r_LR", input_r_lr, epoch)
+        _run.log_scalar("Val_t_CL", val_t_cl, epoch)
+        _run.log_scalar("Val_t_CR", val_t_cr, epoch)
+        _run.log_scalar("Val_t_LR", val_t_lr, epoch)
+        _run.log_scalar("Val_r_CL", val_r_cl, epoch)
+        _run.log_scalar("Val_r_CR", val_r_cr, epoch)
+        _run.log_scalar("Val_r_LR", val_r_lr, epoch)
+        _wandb_log(wandb_enabled, {
+            "epoch": epoch,
+            "val/loss": val_loss,
+            "val/input_t_CL_cm": input_t_cl,
+            "val/input_t_CR_cm": input_t_cr,
+            "val/input_t_LR_cm": input_t_lr,
+            "val/input_r_CL_deg": input_r_cl,
+            "val/input_r_CR_deg": input_r_cr,
+            "val/input_r_LR_deg": input_r_lr,
+        })
+
+        if train_epoch_loss is not None and val_loss < BEST_VAL_LOSS:
+            BEST_VAL_LOSS = val_loss
+            _run.result = val_loss
+            savefilename = f'{model_savepath}/checkpoint_tri_e{epoch}_{val_loss:.3f}.tar'
+            torch.save({
+                'config': _config,
+                'epoch': epoch,
+                'state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'train_loss': train_epoch_loss,
+                'val_loss': val_loss,
+                'val_t_cl': val_t_cl,
+                'val_t_cr': val_t_cr,
+                'val_t_lr': val_t_lr,
+                'val_r_cl': val_r_cl,
+                'val_r_cr': val_r_cr,
+                'val_r_lr': val_r_lr,
+            }, savefilename)
+            print(f'Model saved as {savefilename}')
+            if old_save_filename is not None and os.path.exists(old_save_filename):
+                os.remove(old_save_filename)
+            old_save_filename = savefilename
+
+        return val_loss
+
+    if _config['network'].startswith('Tri'):
+        print("Running initial validation before training...")
+        run_tri_validation(epoch=-1, train_epoch_loss=None)
+
     for epoch in range(starting_epoch, _config['epochs'] + 1):
         EPOCH = epoch
         print('This is %d-th epoch' % epoch)
@@ -674,6 +954,50 @@ def main(_config, _run, seed):
             _run.log_scalar("LR", scheduler.get_lr()[0])
         current_lr = optimizer.param_groups[0]['lr']
         _wandb_log(wandb_enabled, {"epoch": epoch, "train/lr": current_lr})
+
+        if _config['network'].startswith('Tri'):
+            # Minimal tri-modal baseline loop (no cost-volume path, no recurrence/reliability).
+            model.train()
+            for batch_idx, sample in enumerate(TrainImgLoader):
+                rgb = sample['rgb'].to(device, non_blocking=True)
+                lidar_proj = sample['lidar_proj'].to(device, non_blocking=True)
+                radar_proj = sample['radar_proj'].to(device, non_blocking=True)
+                gt_batch = {
+                    'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
+                    'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
+                    'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
+                    'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
+                    'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
+                    'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
+                }
+
+                optimizer.zero_grad()
+                pred = model(rgb, lidar_proj, radar_proj)
+                loss = loss_fn(pred, gt_batch)
+                loss['total_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_train_loss += loss['total_loss'].item() * rgb.shape[0]
+                if batch_idx % _config['log_frequency'] == 0:
+                    print(
+                        f"[Tri Train] Iter {batch_idx}/{len(TrainImgLoader)} "
+                        f"loss={loss['total_loss'].item():.4f} "
+                        f"CL={loss['loss_cl'].item():.4f} "
+                        f"CR={loss['loss_cr'].item():.4f} "
+                        f"LR={loss['loss_lr'].item():.4f}"
+                    )
+
+            train_epoch_loss = total_train_loss / len(dataset_train)
+            print("------------------------------------")
+            print(f"epoch {epoch} total training loss = {train_epoch_loss:.3f}")
+            print(f"Total epoch time = {time.time() - epoch_start_time:.2f}")
+            print("------------------------------------")
+            _run.log_scalar("Total training loss", train_epoch_loss, epoch)
+            _wandb_log(wandb_enabled, {"epoch": epoch, "train/epoch_loss": train_epoch_loss})
+            if (epoch + 1) % 20 == 0:
+                run_tri_validation(epoch=epoch, train_epoch_loss=train_epoch_loss)
+            continue
 
 
         ## Training ##

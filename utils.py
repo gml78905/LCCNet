@@ -11,7 +11,10 @@
 
 import math
 
-import mathutils
+try:
+    import mathutils
+except ImportError:
+    mathutils = None
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,6 +23,8 @@ from torch.utils.data.dataloader import default_collate
 
 
 def rotate_points(PC, R, T=None, inverse=True):
+    if mathutils is None:
+        raise ImportError("mathutils is required for rotate_points but is not installed.")
     if T is not None:
         R = R.to_matrix()
         R.resize_4x4()
@@ -106,6 +111,8 @@ def invert_pose(R, T):
     Returns:
         (R_GT, T_GT) = (mathutils.Quaternion, mathutils.Vector)
     """
+    if mathutils is None:
+        raise ImportError("mathutils is required for invert_pose but is not installed.")
     R = R.to_matrix()
     R.resize_4x4()
     T = mathutils.Matrix.Translation(T)
@@ -116,6 +123,10 @@ def invert_pose(R, T):
 
 
 def merge_inputs(queries):
+    # Generic path for datasets that already return fully collatable tensors.
+    if 'point_cloud' not in queries[0]:
+        return default_collate(queries)
+
     point_clouds = []
     imgs = []
     reflectances = []
