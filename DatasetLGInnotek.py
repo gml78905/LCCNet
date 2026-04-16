@@ -746,7 +746,8 @@ class DatasetTriModalLGInnotek(Dataset):
             return self.__getitem__(new_idx)
 
         rgb = self.custom_transform(img, img_rotation=0., flip=False)
-        rgb = F.interpolate(rgb.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+        if self.input_size is not None:
+            rgb = F.interpolate(rgb.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
 
         lidar_pc = _load_point_cloud(lidar_path, self.pcd_reader)
         radar_pc = _load_point_cloud(radar_path, self.pcd_reader)
@@ -769,8 +770,9 @@ class DatasetTriModalLGInnotek(Dataset):
 
         lidar_proj = torch.from_numpy(lidar_depth).unsqueeze(0)  # [1, H, W]
         radar_proj = torch.from_numpy(np.stack([radar_depth, radar_aux], axis=0))  # [2, H, W]
-        lidar_proj = F.interpolate(lidar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
-        radar_proj = F.interpolate(radar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+        if self.input_size is not None:
+            lidar_proj = F.interpolate(lidar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
+            radar_proj = F.interpolate(radar_proj.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
 
         T_CL_t_gt, T_CL_q_gt = self._matrix_to_t_q(self.T_cam_lidar)
         T_CR_t_gt, T_CR_q_gt = self._matrix_to_t_q(self.T_cam_radar)
