@@ -21,12 +21,15 @@ except ImportError:
     mathutils = None
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
 from torch.utils.data import ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 import os.path as osp
 
 from sacred import Experiment
@@ -359,6 +362,15 @@ def main(_config, _run, seed):
     print('Loss Function Choice: {}'.format(_config['loss']))
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this run, but no GPU is available.")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    is_main_process = (rank == 0)
+    if distributed:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}" if distributed else "cuda")
 
     if _config['dataset'] in ['hercules', 'lg_innotek']:
         sensor_mode = _config.get('sensor_mode', 'radar').lower()  # Default to 'radar' for backward compatibility
@@ -526,19 +538,17 @@ def main(_config, _run, seed):
         model_savepath = os.path.join(checkpoints_dir, checkpoint_name, 'models')
     else:
         model_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'models')
-    if not os.path.exists(model_savepath):
-        os.makedirs(model_savepath)
+    os.makedirs(model_savepath, exist_ok=True)
     if _config['dataset'] in ['hercules', 'lg_innotek']:
         # Use the same checkpoint_name for log path
         log_savepath = os.path.join(checkpoints_dir, checkpoint_name, 'log')
     else:
         log_savepath = os.path.join(checkpoints_dir, 'val_seq_' + val_sequence, 'log')
-    if not os.path.exists(log_savepath):
-        os.makedirs(log_savepath)
-    train_writer = SummaryWriter(os.path.join(log_savepath, 'train'))
-    val_writer = SummaryWriter(os.path.join(log_savepath, 'val'))
+    os.makedirs(log_savepath, exist_ok=True)
+    train_writer = SummaryWriter(os.path.join(log_savepath, 'train')) if is_main_process else None
+    val_writer = SummaryWriter(os.path.join(log_savepath, 'val')) if is_main_process else None
 
-    wandb_enabled = bool(_config.get('wandb_enabled', False))
+    wandb_enabled = bool(_config.get('wandb_enabled', False)) and is_main_process
     if wandb_enabled and wandb is None:
         print("Warning: wandb is not installed. Disabling wandb logging.")
         wandb_enabled = False
@@ -566,8 +576,9 @@ def main(_config, _run, seed):
             wandb.run.summary['checkpoint_dir'] = model_savepath
             wandb.run.summary['log_dir'] = log_savepath
 
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
+    np.random.seed(seed + rank)
+    torch.random.manual_seed(seed + rank)
+    random.seed(seed + rank)
 
     def init_fn(x): return _init_fn(x, seed)
 
@@ -579,8 +590,15 @@ def main(_config, _run, seed):
     # Training and validation set creation
     num_worker = _config['num_worker']
     batch_size = _config['batch_size']
+    train_sampler = None
+    val_sampler = None
+    if distributed and _config.get('network', '').startswith('Tri') and _config.get('use_dataparallel', True):
+        train_sampler = DistributedSampler(dataset_train, num_replicas=world_size, rank=rank, shuffle=True)
+        # Validation in tri path is executed on rank0 only, so keep full val set there.
+        val_sampler = None
     TrainImgLoader = torch.utils.data.DataLoader(dataset=dataset_train,
-                                                 shuffle=True,
+                                                 shuffle=(train_sampler is None),
+                                                 sampler=train_sampler,
                                                  batch_size=batch_size,
                                                  num_workers=num_worker,
                                                  worker_init_fn=init_fn,
@@ -590,6 +608,7 @@ def main(_config, _run, seed):
 
     ValImgLoader = torch.utils.data.DataLoader(dataset=dataset_val,
                                                 shuffle=False,
+                                                sampler=val_sampler,
                                                 batch_size=batch_size,
                                                 num_workers=num_worker,
                                                 worker_init_fn=init_fn,
@@ -670,9 +689,15 @@ def main(_config, _run, seed):
     # model = model.to(device)
     use_dataparallel = _config.get('use_dataparallel', True)
     visible_gpus = [gpu.strip() for gpu in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if gpu.strip() != '']
-    if use_dataparallel and torch.cuda.is_available() and torch.cuda.device_count() > 1 and len(visible_gpus) > 1:
-        model = nn.DataParallel(model)
-    model = model.to(device)
+    if distributed and use_dataparallel:
+        if not _config['network'].startswith('Tri'):
+            raise ValueError("torchrun/DDP is currently supported only for Tri networks in this script.")
+        model = model.to(device)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    else:
+        if use_dataparallel and torch.cuda.is_available() and torch.cuda.device_count() > 1 and len(visible_gpus) > 1:
+            model = nn.DataParallel(model)
+        model = model.to(device)
 
     print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -710,31 +735,38 @@ def main(_config, _run, seed):
             'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
             'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
         }
-        print(f"[Tri Debug] rgb={tuple(rgb.shape)} lidar_proj={tuple(lidar_proj.shape)} radar_proj={tuple(radar_proj.shape)}")
+        if is_main_process:
+            print(f"[Tri Debug] rgb={tuple(rgb.shape)} lidar_proj={tuple(lidar_proj.shape)} radar_proj={tuple(radar_proj.shape)}")
         assert rgb.ndim == 4 and rgb.shape[1] == 3 and rgb.shape[2] == 288 and rgb.shape[3] == 512
         assert lidar_proj.ndim == 4 and lidar_proj.shape[1] == 1 and lidar_proj.shape[2] == 288 and lidar_proj.shape[3] == 512
         assert radar_proj.ndim == 4 and radar_proj.shape[1] == 2 and radar_proj.shape[2] == 288 and radar_proj.shape[3] == 512
 
         optimizer.zero_grad()
         pred = model(rgb, lidar_proj, radar_proj)
-        print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
-        print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
-        print(f"[Tri Debug] T_LR_t={tuple(pred['T_LR_t'].shape)} T_LR_q={tuple(pred['T_LR_q'].shape)}")
+        if is_main_process:
+            print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
+            print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
+            print(f"[Tri Debug] T_LR_t={tuple(pred['T_LR_t'].shape)} T_LR_q={tuple(pred['T_LR_q'].shape)}")
         assert pred['T_CL_t'].shape[1] == 3 and pred['T_CL_q'].shape[1] == 4
         assert pred['T_CR_t'].shape[1] == 3 and pred['T_CR_q'].shape[1] == 4
         assert pred['T_LR_t'].shape[1] == 3 and pred['T_LR_q'].shape[1] == 4
 
         losses = loss_fn(pred, gt_batch)
-        print(
-            f"[Tri Debug] total_loss={losses['total_loss'].item():.6f} "
-            f"CL={losses['loss_cl'].item():.6f} "
-            f"CR={losses['loss_cr'].item():.6f} "
-            f"LR={losses['loss_lr'].item():.6f}"
-        )
+        if is_main_process:
+            print(
+                f"[Tri Debug] total_loss={losses['total_loss'].item():.6f} "
+                f"CL={losses['loss_cl'].item():.6f} "
+                f"CR={losses['loss_cr'].item():.6f} "
+                f"LR={losses['loss_lr'].item():.6f}"
+            )
         losses['total_loss'].backward()
         optimizer.step()
-        print("[Tri Debug] one-batch dataset -> model -> loss -> backward succeeded.")
-        return losses['total_loss'].item()
+        if distributed:
+            dist.barrier()
+        if is_main_process:
+            print("[Tri Debug] one-batch dataset -> model -> loss -> backward succeeded.")
+            return losses['total_loss'].item()
+        return None
 
     # Allow mixed-precision if needed
     # model, optimizer = apex.amp.initialize(model, optimizer, opt_level=_config["precision"])
@@ -750,6 +782,8 @@ def main(_config, _run, seed):
     def run_tri_validation(epoch, train_epoch_loss=None):
         nonlocal BEST_VAL_LOSS, old_save_filename, val_iter
         model.eval()
+        eval_model = model.module if isinstance(model, DDP) else model
+        eval_model.eval()
         total_val_loss = 0.0
         total_input_t_cl = 0.0
         total_input_t_cr = 0.0
@@ -793,7 +827,7 @@ def main(_config, _run, seed):
                 input_q_cl = _matrix_batch_to_quaternion(T_cl_input)
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
-                pred = model(rgb, lidar_proj, radar_proj)
+                pred = eval_model(rgb, lidar_proj, radar_proj)
                 loss = loss_fn(pred, gt_batch)
                 total_val_loss += loss['total_loss'].item() * rgb.shape[0]
 
@@ -915,7 +949,7 @@ def main(_config, _run, seed):
             torch.save({
                 'config': _config,
                 'epoch': epoch,
-                'state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                'state_dict': model.module.state_dict() if isinstance(model, (nn.DataParallel, DDP)) else model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'train_loss': train_epoch_loss,
                 'val_loss': val_loss,
@@ -933,13 +967,18 @@ def main(_config, _run, seed):
 
         return val_loss
 
-    if _config['network'].startswith('Tri'):
+    if _config['network'].startswith('Tri') and is_main_process:
         print("Running initial validation before training...")
         run_tri_validation(epoch=-1, train_epoch_loss=None)
+    if distributed:
+        dist.barrier()
 
     for epoch in range(starting_epoch, _config['epochs'] + 1):
         EPOCH = epoch
-        print('This is %d-th epoch' % epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_main_process:
+            print('This is %d-th epoch' % epoch)
         epoch_start_time = time.time()
         total_train_loss = 0
         local_loss = 0.
@@ -979,7 +1018,7 @@ def main(_config, _run, seed):
                 optimizer.step()
 
                 total_train_loss += loss['total_loss'].item() * rgb.shape[0]
-                if batch_idx % _config['log_frequency'] == 0:
+                if is_main_process and batch_idx % _config['log_frequency'] == 0:
                     print(
                         f"[Tri Train] Iter {batch_idx}/{len(TrainImgLoader)} "
                         f"loss={loss['total_loss'].item():.4f} "
@@ -988,15 +1027,22 @@ def main(_config, _run, seed):
                         f"LR={loss['loss_lr'].item():.4f}"
                     )
 
+            if distributed:
+                total_train_loss_tensor = torch.tensor(total_train_loss, device=device)
+                dist.all_reduce(total_train_loss_tensor, op=dist.ReduceOp.SUM)
+                total_train_loss = total_train_loss_tensor.item()
             train_epoch_loss = total_train_loss / len(dataset_train)
-            print("------------------------------------")
-            print(f"epoch {epoch} total training loss = {train_epoch_loss:.3f}")
-            print(f"Total epoch time = {time.time() - epoch_start_time:.2f}")
-            print("------------------------------------")
-            _run.log_scalar("Total training loss", train_epoch_loss, epoch)
-            _wandb_log(wandb_enabled, {"epoch": epoch, "train/epoch_loss": train_epoch_loss})
-            if (epoch + 1) % 20 == 0:
+            if is_main_process:
+                print("------------------------------------")
+                print(f"epoch {epoch} total training loss = {train_epoch_loss:.3f}")
+                print(f"Total epoch time = {time.time() - epoch_start_time:.2f}")
+                print("------------------------------------")
+                _run.log_scalar("Total training loss", train_epoch_loss, epoch)
+                _wandb_log(wandb_enabled, {"epoch": epoch, "train/epoch_loss": train_epoch_loss})
+            if (epoch + 1) % 20 == 0 and is_main_process:
                 run_tri_validation(epoch=epoch, train_epoch_loss=train_epoch_loss)
+            if distributed:
+                dist.barrier()
             continue
 
 
@@ -1368,4 +1414,11 @@ def main(_config, _run, seed):
     if wandb_enabled and wandb is not None and wandb.run is not None:
         wandb.run.summary['full_training_time_hr'] = (time.time() - start_full_time) / 3600
         wandb.finish()
+    if train_writer is not None:
+        train_writer.close()
+    if val_writer is not None:
+        val_writer.close()
+    if distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
     return _run.result

@@ -71,7 +71,12 @@ CONTAINER_NAME="lccnet_${GPU_NUM//,/_}"
 # --------------------------------------------------
 # GPU 옵션
 if command -v nvidia-smi &> /dev/null; then
-    GPU_FLAG="--gpus device=${GPU_NUM}"
+    # NOTE:
+    # Docker versions differ in how they parse `--gpus device=1,2`.
+    # Some parse it as both DeviceIDs and Count, causing:
+    # "cannot set both Count and DeviceIDs on device request."
+    # Use `--gpus all` and limit visibility via NVIDIA/CUDA env vars.
+    GPU_FLAG="--gpus all"
     echo "GPU detected. Using GPU(s): ${GPU_NUM}"
 else
     GPU_FLAG=""
@@ -143,6 +148,13 @@ fi
 ENV_ARGS=(
     -e PYTHONUNBUFFERED=1
 )
+
+if [ -n "${GPU_FLAG}" ]; then
+    ENV_ARGS+=(
+        -e NVIDIA_VISIBLE_DEVICES="${GPU_NUM}"
+        -e CUDA_VISIBLE_DEVICES="${GPU_NUM}"
+    )
+fi
 
 if [ -n "${WANDB_API_KEY}" ]; then
     ENV_ARGS+=(-e WANDB_API_KEY="${WANDB_API_KEY}")
