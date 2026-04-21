@@ -49,6 +49,7 @@ from losses import DistancePoints3D, GeometricLoss, L1Loss, ProposedLoss, Combin
 from losses_tri import TriModalPairwiseLoss
 from models.LCCNet import LCCNet
 from models.tri_calib.model import TriModalCalibNet
+from models.tri_joint.model import TriModalJointCalibNetV1, TriModalJointCalibNetV2
 
 from quaternion_distances import quaternion_distance
 
@@ -133,6 +134,7 @@ def config():
     tri_amp_dtype = 'fp16'  # 'fp16' or 'bf16'
     tri_use_compile = True
     tri_compile_mode = 'reduce-overhead'
+    tri_joint_debug_return_aux = True
     loader_persistent_workers = True
     loader_prefetch_factor = 4
 
@@ -706,6 +708,20 @@ def main(_config, _run, seed):
         model = LCCNet(input_size, use_feat_from=feat, md=md,
                          use_reflectance=_config['use_reflectance'], dropout=_config['dropout'],
                          Action_Func='leakyrelu', attention=False, res_num=18)
+    elif _config['network'].startswith('TriJointV2'):
+        model = TriModalJointCalibNetV2(
+            camera_pretrained=False,
+            activation='leakyrelu',
+            head_hidden_dim=256,
+            head_dropout=_config['dropout'],
+        )
+    elif _config['network'].startswith('TriJoint'):
+        model = TriModalJointCalibNetV1(
+            camera_pretrained=False,
+            activation='leakyrelu',
+            head_hidden_dim=256,
+            head_dropout=_config['dropout'],
+        )
     elif _config['network'].startswith('Tri'):
         model = TriModalCalibNet(
             camera_pretrained=False,
@@ -787,7 +803,7 @@ def main(_config, _run, seed):
     tri_use_grad_scaler = tri_amp_enabled and tri_amp_dtype == torch.float16
     tri_grad_scaler = torch.cuda.amp.GradScaler(enabled=tri_use_grad_scaler)
 
-    if _config['network'].startswith('Tri') and _config.get('tri_run_one_batch', True):
+    if False and _config['network'].startswith('Tri') and _config.get('tri_run_one_batch', True):
         model.train()
         sample = next(iter(TrainImgLoader))
         rgb = sample['rgb'].to(device, non_blocking=True)
@@ -896,6 +912,26 @@ def main(_config, _run, seed):
         corrected_t, corrected_q = _matrix_to_pose_batch(corrected_T)
         return corrected_t, corrected_q, corrected_T
 
+    def _tri_model_forward(forward_model, rgb_batch, lidar_batch, radar_batch, return_aux=False):
+        """
+        TriBaseline:
+          out = pred_dict
+        TriJointV1:
+          out = (pred_dict, new_state) or (pred_dict, new_state, aux_dict)
+        """
+        if return_aux:
+            out = forward_model(rgb_batch, lidar_batch, radar_batch, state=None, return_aux=True)
+        else:
+            out = forward_model(rgb_batch, lidar_batch, radar_batch)
+        if isinstance(out, tuple):
+            if len(out) == 3:
+                pred_out, new_state_out, aux_out = out
+                return pred_out, new_state_out, aux_out
+            if len(out) == 2:
+                pred_out, new_state_out = out
+                return pred_out, new_state_out, {}
+        return out, None, {}
+
     def _build_tri_projection_batch(sample_batch):
         if 'lidar_proj' in sample_batch and 'radar_proj' in sample_batch:
             return (
@@ -957,6 +993,92 @@ def main(_config, _run, seed):
             radar_tensor = F.interpolate(radar_tensor, size=input_size, mode='bilinear', align_corners=False)
         return lidar_tensor, radar_tensor
 
+    if _config['network'].startswith('Tri') and _config.get('tri_run_one_batch', True):
+        is_tri_joint = _config['network'].startswith('TriJoint')
+        model.train()
+        sample = next(iter(TrainImgLoader))
+        rgb = sample['rgb'].to(device, non_blocking=True)
+        lidar_proj, radar_proj = _build_tri_projection_batch(sample)
+        gt_batch = {
+            'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
+            'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
+            'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
+            'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
+            'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
+            'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
+            'T_CL_input': sample['T_CL_input'].to(device, non_blocking=True),
+            'T_CR_input': sample['T_CR_input'].to(device, non_blocking=True),
+        }
+        gt_batch['T_LR_input'] = torch.linalg.inv(gt_batch['T_CL_input']) @ gt_batch['T_CR_input']
+        if is_main_process:
+            print(f"[Tri Debug] rgb={tuple(rgb.shape)} lidar_proj={tuple(lidar_proj.shape)} radar_proj={tuple(radar_proj.shape)}")
+        if rgb.ndim == 5:
+            assert rgb.shape[2] == 3 and rgb.shape[3] == 288 and rgb.shape[4] == 512
+            assert lidar_proj.ndim == 5 and lidar_proj.shape[2] == 1 and lidar_proj.shape[3] == 288 and lidar_proj.shape[4] == 512
+            assert radar_proj.ndim == 5 and radar_proj.shape[2] == 2 and radar_proj.shape[3] == 288 and radar_proj.shape[4] == 512
+        else:
+            assert rgb.ndim == 4 and rgb.shape[1] == 3 and rgb.shape[2] == 288 and rgb.shape[3] == 512
+            assert lidar_proj.ndim == 4 and lidar_proj.shape[1] == 1 and lidar_proj.shape[2] == 288 and lidar_proj.shape[3] == 512
+            assert radar_proj.ndim == 4 and radar_proj.shape[1] == 2 and radar_proj.shape[2] == 288 and radar_proj.shape[3] == 512
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
+            debug_return_aux = bool(_config.get('tri_joint_debug_return_aux', True)) and is_tri_joint
+            pred, new_state_debug, aux_debug = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=debug_return_aux)
+            losses = loss_fn(pred, gt_batch)
+        if is_main_process:
+            print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
+            print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
+            print(f"[Tri Debug] T_LR_t={tuple(pred['T_LR_t'].shape)} T_LR_q={tuple(pred['T_LR_q'].shape)}")
+            if is_tri_joint and new_state_debug is not None:
+                print(
+                    "[TriJoint Debug] new_state "
+                    f"h_shared={tuple(new_state_debug['h_shared'].shape)} "
+                    f"h_cl={tuple(new_state_debug['h_cl'].shape)} "
+                    f"h_cr={tuple(new_state_debug['h_cr'].shape)} "
+                    f"h_lr={tuple(new_state_debug['h_lr'].shape)}"
+                )
+            if is_tri_joint and debug_return_aux and len(aux_debug) > 0:
+                aux_keys = ['r_cl_coarse', 'w_c', 'w_cl', 'r_cl_ref', 'gate_cl', 'R_cam', 'r_cl0']
+                for k in aux_keys:
+                    if k in aux_debug:
+                        print(f"[TriJoint Debug] aux[{k}]={tuple(aux_debug[k].shape)}")
+                if 'R_cam' in aux_debug:
+                    print(
+                        f"[TriJoint Debug] R_cam stats "
+                        f"mean={aux_debug['R_cam'].mean().item():.4f} "
+                        f"min={aux_debug['R_cam'].min().item():.4f} "
+                        f"max={aux_debug['R_cam'].max().item():.4f}"
+                    )
+        assert pred['T_CL_t'].shape[-1] == 3 and pred['T_CL_q'].shape[-1] == 4
+        assert pred['T_CR_t'].shape[-1] == 3 and pred['T_CR_q'].shape[-1] == 4
+        assert pred['T_LR_t'].shape[-1] == 3 and pred['T_LR_q'].shape[-1] == 4
+
+        if is_main_process:
+            print(
+                f"[Tri Debug] total_loss={losses['total_loss'].item():.6f} "
+                f"CL={losses['loss_cl'].item():.6f} "
+                f"CR={losses['loss_cr'].item():.6f} "
+                f"LR={losses['loss_lr'].item():.6f} "
+                f"LOOP={losses['loss_loop'].item():.6f}"
+            )
+        if tri_use_grad_scaler:
+            tri_grad_scaler.scale(losses['total_loss']).backward()
+            tri_grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            tri_grad_scaler.step(optimizer)
+            tri_grad_scaler.update()
+        else:
+            losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        if distributed:
+            dist.barrier()
+        if is_main_process:
+            print("[Tri Debug] one-batch dataset -> model -> loss -> backward succeeded.")
+            return losses['total_loss'].item()
+        return None
+
     def run_tri_validation(epoch, train_epoch_loss=None):
         nonlocal BEST_VAL_LOSS, old_save_filename, val_iter
         model.eval()
@@ -1009,7 +1131,7 @@ def main(_config, _run, seed):
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    pred = eval_model(rgb, lidar_proj, radar_proj)
+                    pred, _, _ = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=False)
                     loss = loss_fn(pred, gt_batch)
                 batch_item_count = _batch_item_count(rgb)
                 total_eval_count += batch_item_count
@@ -1240,7 +1362,7 @@ def main(_config, _run, seed):
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    pred = model(rgb, lidar_proj, radar_proj)
+                    pred, _, _ = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=False)
                     loss = loss_fn(pred, gt_batch)
                 if tri_use_grad_scaler:
                     tri_grad_scaler.scale(loss['total_loss']).backward()
