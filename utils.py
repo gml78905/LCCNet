@@ -125,7 +125,14 @@ def invert_pose(R, T):
 def merge_inputs(queries):
     # Generic path for datasets that already return fully collatable tensors.
     if 'point_cloud' not in queries[0]:
-        return default_collate(queries)
+        non_collatable_keys = {'lidar_pc', 'radar_pc', 'lidar_pc_seq', 'radar_pc_seq'}
+        collated = {}
+        for key in queries[0]:
+            if key in non_collatable_keys:
+                collated[key] = [d[key] for d in queries]
+            else:
+                collated[key] = default_collate([d[key] for d in queries])
+        return collated
 
     point_clouds = []
     imgs = []
@@ -144,48 +151,121 @@ def merge_inputs(queries):
     return returns
 
 
+def project_pointcloud_to_image_torch(pc_sensor, T_cam_sensor, calib, image_hw, max_depth):
+    if pc_sensor.numel() == 0:
+        h, w = image_hw
+        depth = torch.zeros((h, w), device=T_cam_sensor.device, dtype=T_cam_sensor.dtype)
+        aux_map = torch.zeros((h, w), device=T_cam_sensor.device, dtype=T_cam_sensor.dtype)
+        return depth, aux_map
+
+    xyz = pc_sensor[:, :3]
+    ones = torch.ones((xyz.shape[0], 1), device=pc_sensor.device, dtype=pc_sensor.dtype)
+    xyz1 = torch.cat([xyz, ones], dim=1)
+    pc_cam = torch.matmul(xyz1, T_cam_sensor.t())
+
+    x = pc_cam[:, 0]
+    y = pc_cam[:, 1]
+    z = pc_cam[:, 2]
+    aux = pc_sensor[:, 3] if pc_sensor.shape[1] > 3 else torch.zeros_like(z)
+    h, w = int(image_hw[0]), int(image_hw[1])
+
+    valid = (z > 1e-5) & (z < max_depth)
+    if not torch.any(valid):
+        depth = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+        aux_map = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+        return depth, aux_map
+
+    x = x[valid]
+    y = y[valid]
+    z = z[valid]
+    aux = aux[valid]
+
+    u = torch.round((calib[0, 0] * x / z) + calib[0, 2]).long()
+    v = torch.round((calib[1, 1] * y / z) + calib[1, 2]).long()
+    in_img = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if not torch.any(in_img):
+        depth = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+        aux_map = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+        return depth, aux_map
+
+    u = u[in_img]
+    v = v[in_img]
+    z = z[in_img]
+    aux = aux[in_img]
+
+    depth = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+    aux_map = torch.zeros((h, w), device=pc_sensor.device, dtype=pc_sensor.dtype)
+    depth[v, u] = z
+    aux_map[v, u] = aux
+    depth = depth / max_depth
+    return depth, aux_map
+
+
 def quaternion_from_matrix(matrix):
     """
-    Convert a rotation matrix to quaternion.
+    Convert rotation matrix/matrices to quaternion(s).
     Args:
-        matrix (torch.Tensor): [4x4] transformation matrix or [3,3] rotation matrix.
+        matrix (torch.Tensor): [4,4], [3,3], [B,4,4], or [B,3,3]
 
     Returns:
-        torch.Tensor: shape [4], normalized quaternion
+        torch.Tensor: [4] for single input, or [B,4] for batched input
     """
-    if matrix.shape == (4, 4):
-        R = matrix[:-1, :-1]
-    elif matrix.shape == (3, 3):
-        R = matrix
-    else:
+    if matrix.ndim not in (2, 3):
         raise TypeError("Not a valid rotation matrix")
-    tr = R[0, 0] + R[1, 1] + R[2, 2]
-    q = torch.zeros(4, device=matrix.device)
-    if tr > 0.:
-        S = (tr+1.0).sqrt() * 2
-        q[0] = 0.25 * S
-        q[1] = (R[2, 1] - R[1, 2]) / S
-        q[2] = (R[0, 2] - R[2, 0]) / S
-        q[3] = (R[1, 0] - R[0, 1]) / S
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        S = (1.0 + R[0, 0] - R[1, 1] - R[2, 2]).sqrt() * 2
-        q[0] = (R[2, 1] - R[1, 2]) / S
-        q[1] = 0.25 * S
-        q[2] = (R[0, 1] + R[1, 0]) / S
-        q[3] = (R[0, 2] + R[2, 0]) / S
-    elif R[1, 1] > R[2, 2]:
-        S = (1.0 + R[1, 1] - R[0, 0] - R[2, 2]).sqrt() * 2
-        q[0] = (R[0, 2] - R[2, 0]) / S
-        q[1] = (R[0, 1] + R[1, 0]) / S
-        q[2] = 0.25 * S
-        q[3] = (R[1, 2] + R[2, 1]) / S
+
+    batched = matrix.ndim == 3
+    if batched:
+        if matrix.shape[-2:] == (4, 4):
+            R = matrix[:, :3, :3]
+        elif matrix.shape[-2:] == (3, 3):
+            R = matrix
+        else:
+            raise TypeError("Not a valid rotation matrix")
     else:
-        S = (1.0 + R[2, 2] - R[0, 0] - R[1, 1]).sqrt() * 2
-        q[0] = (R[1, 0] - R[0, 1]) / S
-        q[1] = (R[0, 2] + R[2, 0]) / S
-        q[2] = (R[1, 2] + R[2, 1]) / S
-        q[3] = 0.25 * S
-    return q / q.norm()
+        if matrix.shape == (4, 4):
+            R = matrix[:3, :3].unsqueeze(0)
+        elif matrix.shape == (3, 3):
+            R = matrix.unsqueeze(0)
+        else:
+            raise TypeError("Not a valid rotation matrix")
+
+    q = torch.zeros((R.shape[0], 4), device=R.device, dtype=R.dtype)
+    tr = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+
+    mask1 = tr > 0.0
+    if torch.any(mask1):
+        S = torch.sqrt(tr[mask1] + 1.0) * 2.0
+        q[mask1, 0] = 0.25 * S
+        q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) / S
+        q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) / S
+        q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) / S
+
+    mask2 = (~mask1) & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
+    if torch.any(mask2):
+        S = torch.sqrt(1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]) * 2.0
+        q[mask2, 0] = (R[mask2, 2, 1] - R[mask2, 1, 2]) / S
+        q[mask2, 1] = 0.25 * S
+        q[mask2, 2] = (R[mask2, 0, 1] + R[mask2, 1, 0]) / S
+        q[mask2, 3] = (R[mask2, 0, 2] + R[mask2, 2, 0]) / S
+
+    mask3 = (~mask1) & (~mask2) & (R[:, 1, 1] > R[:, 2, 2])
+    if torch.any(mask3):
+        S = torch.sqrt(1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]) * 2.0
+        q[mask3, 0] = (R[mask3, 0, 2] - R[mask3, 2, 0]) / S
+        q[mask3, 1] = (R[mask3, 0, 1] + R[mask3, 1, 0]) / S
+        q[mask3, 2] = 0.25 * S
+        q[mask3, 3] = (R[mask3, 1, 2] + R[mask3, 2, 1]) / S
+
+    mask4 = (~mask1) & (~mask2) & (~mask3)
+    if torch.any(mask4):
+        S = torch.sqrt(1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]) * 2.0
+        q[mask4, 0] = (R[mask4, 1, 0] - R[mask4, 0, 1]) / S
+        q[mask4, 1] = (R[mask4, 0, 2] + R[mask4, 2, 0]) / S
+        q[mask4, 2] = (R[mask4, 1, 2] + R[mask4, 2, 1]) / S
+        q[mask4, 3] = 0.25 * S
+
+    q = q / q.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    return q if batched else q[0]
 
 
 def quatmultiply(q, r):
@@ -213,32 +293,42 @@ def quatmultiply(q, r):
 
 def quat2mat(q):
     """
-    Convert a quaternion to a rotation matrix
+    Convert quaternion(s) to homogeneous rotation matrix/matrices.
     Args:
-        q (torch.Tensor): shape [4], input quaternion
+        q (torch.Tensor): [4] or [B,4]
 
     Returns:
-        torch.Tensor: [4x4] homogeneous rotation matrix
+        torch.Tensor: [4,4] or [B,4,4]
     """
-    assert q.shape == torch.Size([4]), "Not a valid quaternion"
-    q_norm = q.norm()
-    if q_norm < 1e-12:
-        mat = torch.eye(4, device=q.device, dtype=q.dtype)
-        return mat
-    if not torch.isclose(q_norm, torch.tensor(1.0, device=q.device, dtype=q.dtype), atol=1e-6):
-        q = q / q_norm
-    mat = torch.zeros((4, 4), device=q.device)
-    mat[0, 0] = 1 - 2*q[2]**2 - 2*q[3]**2
-    mat[0, 1] = 2*q[1]*q[2] - 2*q[3]*q[0]
-    mat[0, 2] = 2*q[1]*q[3] + 2*q[2]*q[0]
-    mat[1, 0] = 2*q[1]*q[2] + 2*q[3]*q[0]
-    mat[1, 1] = 1 - 2*q[1]**2 - 2*q[3]**2
-    mat[1, 2] = 2*q[2]*q[3] - 2*q[1]*q[0]
-    mat[2, 0] = 2*q[1]*q[3] - 2*q[2]*q[0]
-    mat[2, 1] = 2*q[2]*q[3] + 2*q[1]*q[0]
-    mat[2, 2] = 1 - 2*q[1]**2 - 2*q[2]**2
-    mat[3, 3] = 1.
-    return mat
+    if q.ndim not in (1, 2):
+        raise AssertionError("Not a valid quaternion")
+    batched = q.ndim == 2
+    if not batched and q.shape != torch.Size([4]):
+        raise AssertionError("Not a valid quaternion")
+    if batched and q.shape[1] != 4:
+        raise AssertionError("Not a valid quaternion")
+
+    q_in = q if batched else q.unsqueeze(0)
+    q_norm = q_in.norm(dim=1, keepdim=True)
+    q_safe = q_in / q_norm.clamp(min=1e-12)
+
+    w, x, y, z = q_safe[:, 0], q_safe[:, 1], q_safe[:, 2], q_safe[:, 3]
+    mats = torch.zeros((q_safe.shape[0], 4, 4), device=q_safe.device, dtype=q_safe.dtype)
+    mats[:, 0, 0] = 1 - 2 * y * y - 2 * z * z
+    mats[:, 0, 1] = 2 * x * y - 2 * z * w
+    mats[:, 0, 2] = 2 * x * z + 2 * y * w
+    mats[:, 1, 0] = 2 * x * y + 2 * z * w
+    mats[:, 1, 1] = 1 - 2 * x * x - 2 * z * z
+    mats[:, 1, 2] = 2 * y * z - 2 * x * w
+    mats[:, 2, 0] = 2 * x * z - 2 * y * w
+    mats[:, 2, 1] = 2 * y * z + 2 * x * w
+    mats[:, 2, 2] = 1 - 2 * x * x - 2 * y * y
+    mats[:, 3, 3] = 1.0
+
+    zero_norm_mask = (q_norm.squeeze(1) < 1e-12)
+    if torch.any(zero_norm_mask):
+        mats[zero_norm_mask] = torch.eye(4, device=q_safe.device, dtype=q_safe.dtype)
+    return mats if batched else mats[0]
 
 
 def tvector2mat(t):
