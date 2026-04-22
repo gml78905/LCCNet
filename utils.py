@@ -125,11 +125,45 @@ def invert_pose(R, T):
 def merge_inputs(queries):
     # Generic path for datasets that already return fully collatable tensors.
     if 'point_cloud' not in queries[0]:
-        non_collatable_keys = {'lidar_pc', 'radar_pc', 'lidar_pc_seq', 'radar_pc_seq'}
+        def _pad_point_cloud_batch(point_clouds):
+            sample0 = point_clouds[0]
+            if isinstance(sample0, list):
+                batch_size = len(point_clouds)
+                seq_len = len(sample0)
+                max_points = max(pc.shape[0] for seq in point_clouds for pc in seq)
+                feat_dim = sample0[0].shape[-1] if max_points > 0 else 4
+                dtype = sample0[0].dtype
+                padded = torch.zeros((batch_size, seq_len, max_points, feat_dim), dtype=dtype)
+                mask = torch.zeros((batch_size, seq_len, max_points), dtype=torch.bool)
+                for b, seq in enumerate(point_clouds):
+                    for t, pc in enumerate(seq):
+                        n_points = pc.shape[0]
+                        if n_points == 0:
+                            continue
+                        padded[b, t, :n_points] = pc
+                        mask[b, t, :n_points] = True
+                return padded, mask
+
+            batch_size = len(point_clouds)
+            max_points = max(pc.shape[0] for pc in point_clouds)
+            feat_dim = sample0.shape[-1] if max_points > 0 else 4
+            dtype = sample0.dtype
+            padded = torch.zeros((batch_size, max_points, feat_dim), dtype=dtype)
+            mask = torch.zeros((batch_size, max_points), dtype=torch.bool)
+            for b, pc in enumerate(point_clouds):
+                n_points = pc.shape[0]
+                if n_points == 0:
+                    continue
+                padded[b, :n_points] = pc
+                mask[b, :n_points] = True
+            return padded, mask
+
         collated = {}
         for key in queries[0]:
-            if key in non_collatable_keys:
-                collated[key] = [d[key] for d in queries]
+            if key in {'lidar_pc', 'radar_pc', 'lidar_pc_seq', 'radar_pc_seq'}:
+                padded, mask = _pad_point_cloud_batch([d[key] for d in queries])
+                collated[key] = padded
+                collated[f'{key}_mask'] = mask
             else:
                 collated[key] = default_collate([d[key] for d in queries])
         return collated
@@ -199,6 +233,78 @@ def project_pointcloud_to_image_torch(pc_sensor, T_cam_sensor, calib, image_hw, 
     aux_map[v, u] = aux
     depth = depth / max_depth
     return depth, aux_map
+
+
+def project_pointclouds_to_image_torch_batched(pc_sensor, pc_mask, T_cam_sensor, calib, image_hw, max_depth):
+    """
+    Batched point-cloud projection used by the tri-modal training path.
+
+    Args:
+        pc_sensor: [..., N, 4]
+        pc_mask: [..., N] boolean mask for valid points
+        T_cam_sensor: [..., 4, 4]
+        calib: [..., 3, 3]
+        image_hw: [..., 2]
+
+    Returns:
+        depth: [..., Hmax, Wmax]
+        aux_map: [..., Hmax, Wmax]
+    """
+    if pc_sensor.ndim < 3:
+        raise ValueError("pc_sensor must have shape [..., N, C]")
+
+    leading_shape = pc_sensor.shape[:-2]
+    point_count = pc_sensor.shape[-2]
+    feat_dim = pc_sensor.shape[-1]
+    flat_count = int(np.prod(leading_shape)) if len(leading_shape) > 0 else 1
+
+    flat_pc = pc_sensor.reshape(flat_count, point_count, feat_dim)
+    flat_mask = pc_mask.reshape(flat_count, point_count).bool()
+    flat_T = T_cam_sensor.reshape(flat_count, 4, 4)
+    flat_calib = calib.reshape(flat_count, 3, 3)
+    flat_hw = image_hw.reshape(flat_count, 2).long()
+
+    h_max = int(flat_hw[:, 0].max().item())
+    w_max = int(flat_hw[:, 1].max().item())
+    depth = torch.zeros((flat_count, h_max, w_max), device=flat_pc.device, dtype=flat_pc.dtype)
+    aux_map = torch.zeros((flat_count, h_max, w_max), device=flat_pc.device, dtype=flat_pc.dtype)
+
+    if flat_pc.numel() == 0 or not torch.any(flat_mask):
+        return depth.reshape(*leading_shape, h_max, w_max), aux_map.reshape(*leading_shape, h_max, w_max)
+
+    xyz = flat_pc[:, :, :3]
+    ones = torch.ones((flat_count, point_count, 1), device=flat_pc.device, dtype=flat_pc.dtype)
+    xyz1 = torch.cat([xyz, ones], dim=-1)
+    pc_cam = torch.matmul(xyz1, flat_T.transpose(1, 2))
+
+    x = pc_cam[:, :, 0]
+    y = pc_cam[:, :, 1]
+    z = pc_cam[:, :, 2]
+    aux = flat_pc[:, :, 3] if feat_dim > 3 else torch.zeros_like(z)
+
+    fx = flat_calib[:, None, 0, 0]
+    fy = flat_calib[:, None, 1, 1]
+    cx = flat_calib[:, None, 0, 2]
+    cy = flat_calib[:, None, 1, 2]
+    h = flat_hw[:, None, 0]
+    w = flat_hw[:, None, 1]
+
+    valid = flat_mask & (z > 1e-5) & (z < max_depth)
+    if not torch.any(valid):
+        return depth.reshape(*leading_shape, h_max, w_max), aux_map.reshape(*leading_shape, h_max, w_max)
+
+    z_safe = torch.where(valid, z, torch.ones_like(z))
+    u = torch.round((fx * x / z_safe) + cx).long()
+    v = torch.round((fy * y / z_safe) + cy).long()
+    in_img = valid & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if not torch.any(in_img):
+        return depth.reshape(*leading_shape, h_max, w_max), aux_map.reshape(*leading_shape, h_max, w_max)
+
+    batch_idx = torch.arange(flat_count, device=flat_pc.device)[:, None].expand(flat_count, point_count)
+    depth[batch_idx[in_img], v[in_img], u[in_img]] = z[in_img]
+    aux_map[batch_idx[in_img], v[in_img], u[in_img]] = aux[in_img]
+    depth = depth / max_depth
+    return depth.reshape(*leading_shape, h_max, w_max), aux_map.reshape(*leading_shape, h_max, w_max)
 
 
 def quaternion_from_matrix(matrix):

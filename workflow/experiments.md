@@ -187,6 +187,16 @@
 
 ### Stage 4. Reliability 추가
 
+#### [TriJointV2-0: Hercules full training]
+- 상태: keep
+- 목적: TriJointV2 full architecture를 Hercules tri-modal sequence setting에서 end-to-end로 학습하고 pairwise calibration 성능 및 안정성을 확인
+- 핵심 변경점: TriJointV2 main path(`coarse context -> dense reliability -> reliability-aware evidence aggregation -> memory -> refinement -> delta pose`)를 full training loop에 적용
+- 핵심 성능: best `val loss = 0.387` at epoch `112`; best corrected error `CL 18.106 cm / 0.916 deg`, `CR 40.785 cm / 3.700 deg`, `LR 44.604 cm / 3.932 deg`
+- 속도 / 자원: `120 epoch`, total `12.19 hr`, late epoch time `351-358 sec`, `batch size 36`, `seq_len 4`, input `288x512`, AMP on
+- 요약 분석: TriJointV2는 안정적으로 학습되며 CL 개선은 뚜렷하지만 CR/LR은 여전히 약하다. `epoch 118-119`에서 validation이 크게 흔들려 final checkpoint보다 best checkpoint 사용이 필수다.
+- 상세 기록: [`results/tri_joint_v2_hercules_training_20260422/summary.md`](/home/gml78905/Project/LG/LCCNet/results/tri_joint_v2_hercules_training_20260422/summary.md)
+- 다음 액션: baseline/V1 대비 정량 비교, CR/LR 약세 원인 분석, late-epoch instability 완화
+
 #### [Reliability-0: Pair-level confidence]
 - 상태: TODO
 - 목적: 모든 pair를 동일하게 신뢰하지 않는 구조의 효과 확인

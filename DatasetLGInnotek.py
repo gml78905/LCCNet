@@ -29,6 +29,30 @@ class ReadOpen3d:
         return np.asarray(pcd.points)
 
 
+def _normalize_point_cloud_array(points):
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim == 1:
+        points = points.reshape(1, -1)
+    if points.shape[1] == 3:
+        points = np.hstack([points, np.zeros((points.shape[0], 1), dtype=np.float32)])
+    elif points.shape[1] > 4:
+        points = points[:, :4]
+    return points
+
+
+def _pointcloud_cache_path(file_path):
+    return f"{file_path}.npy"
+
+
+def _save_pointcloud_cache_atomic(cache_path, points):
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    tmp_path = f"{cache_path}.tmp.{os.getpid()}.npy"
+    np.save(tmp_path, points.astype(np.float32))
+    os.replace(tmp_path, cache_path)
+
+
 def _extract_floats(text):
     return [float(x) for x in re.findall(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?', text)]
 
@@ -294,7 +318,15 @@ def _load_triplets(pair_file, image_dir, lidar_dir, radar_dir, split, val_frame_
     return triplets
 
 
-def _load_point_cloud(file_path, pcd_reader):
+def _load_point_cloud(file_path, pcd_reader, use_cache=True, write_cache=False):
+    cache_path = _pointcloud_cache_path(file_path)
+    if use_cache and os.path.exists(cache_path):
+        try:
+            cached_points = np.load(cache_path, allow_pickle=False)
+            return _normalize_point_cloud_array(cached_points)
+        except (OSError, ValueError, EOFError):
+            pass
+
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == '.pcd':
@@ -320,13 +352,12 @@ def _load_point_cloud(file_path, pcd_reader):
     else:
         raise ValueError(f"Unsupported point cloud extension: {file_path}")
 
-    points = np.asarray(points, dtype=np.float32)
-    if points.ndim == 1:
-        points = points.reshape(1, -1)
-    if points.shape[1] == 3:
-        points = np.hstack([points, np.zeros((points.shape[0], 1), dtype=np.float32)])
-    elif points.shape[1] > 4:
-        points = points[:, :4]
+    points = _normalize_point_cloud_array(points)
+    if use_cache and write_cache and not os.path.exists(cache_path):
+        try:
+            _save_pointcloud_cache_atomic(cache_path, points)
+        except OSError:
+            pass
     return points
 
 
@@ -345,7 +376,7 @@ class DatasetTriModalLGInnotek(Dataset):
     def __init__(self, dataset_dir, transform=None, augmentation=False, use_reflectance=False,
                  max_t=1.5, max_r=20., split='val', device='cpu', train_scene=None,
                  val_scene=None, val_frame_limit=None, suf='.png', input_size=(288, 512), max_depth=80.0,
-                 project_on_gpu=False):
+                 project_on_gpu=False, pointcloud_cache=True, pointcloud_cache_write=True):
         super().__init__()
         self.use_reflectance = use_reflectance
         self.device = device
@@ -362,6 +393,8 @@ class DatasetTriModalLGInnotek(Dataset):
         self.input_size = input_size
         self.max_depth = float(max_depth)
         self.project_on_gpu = bool(project_on_gpu)
+        self.pointcloud_cache = bool(pointcloud_cache)
+        self.pointcloud_cache_write = bool(pointcloud_cache_write)
 
         intrinsic_path = os.path.join(dataset_dir, 'intrinsic.txt')
         extrinsic_path = os.path.join(dataset_dir, 'lg_init_extrinsics.yaml')
@@ -425,8 +458,6 @@ class DatasetTriModalLGInnotek(Dataset):
 
     def custom_transform(self, rgb, img_rotation=0., flip=False):
         to_tensor = transforms.ToTensor()
-        normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                             std=[0.229, 0.224, 0.225])
 
         if self.split == 'train':
             color_transform = transforms.ColorJitter(0.1, 0.1, 0.1)
@@ -436,7 +467,10 @@ class DatasetTriModalLGInnotek(Dataset):
             rgb = TTF.rotate(rgb, img_rotation)
 
         rgb = to_tensor(rgb)
-        rgb = normalization(rgb)
+        if not self.project_on_gpu:
+            normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                 std=[0.229, 0.224, 0.225])
+            rgb = normalization(rgb)
         return rgb
 
     def _load_image(self, image_path):
@@ -527,8 +561,18 @@ class DatasetTriModalLGInnotek(Dataset):
         if self.input_size is not None:
             rgb = F.interpolate(rgb.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
 
-        lidar_pc = _load_point_cloud(lidar_path, self.pcd_reader)
-        radar_pc = _load_point_cloud(radar_path, self.pcd_reader)
+        lidar_pc = _load_point_cloud(
+            lidar_path,
+            self.pcd_reader,
+            use_cache=self.pointcloud_cache,
+            write_cache=self.pointcloud_cache_write,
+        )
+        radar_pc = _load_point_cloud(
+            radar_path,
+            self.pcd_reader,
+            use_cache=self.pointcloud_cache,
+            write_cache=self.pointcloud_cache_write,
+        )
         image_hw = (img.height, img.width)
 
         if self.split == 'train':
@@ -586,7 +630,7 @@ class DatasetTriModalHercules(Dataset):
     def __init__(self, dataset_dir, transform=None, augmentation=False, use_reflectance=False,
                  max_t=1.5, max_r=20., split='val', device='cpu', train_scene=None,
                  val_scene=None, val_frame_limit=None, suf='.png', input_size=(288, 512), max_depth=80.0,
-                 project_on_gpu=False):
+                 project_on_gpu=False, pointcloud_cache=True, pointcloud_cache_write=True):
         super().__init__()
         self.use_reflectance = use_reflectance
         self.device = device
@@ -600,6 +644,8 @@ class DatasetTriModalHercules(Dataset):
         self.input_size = input_size
         self.max_depth = float(max_depth)
         self.project_on_gpu = bool(project_on_gpu)
+        self.pointcloud_cache = bool(pointcloud_cache)
+        self.pointcloud_cache_write = bool(pointcloud_cache_write)
         self.val_frame_limit = val_frame_limit
 
         # scene -> {"data_dir", "K", "T_cam_lidar", "T_cam_radar", "T_lidar_radar"}
@@ -818,8 +864,6 @@ class DatasetTriModalHercules(Dataset):
 
     def custom_transform(self, rgb, img_rotation=0., flip=False):
         to_tensor = transforms.ToTensor()
-        normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                             std=[0.229, 0.224, 0.225])
         if self.split == 'train':
             color_transform = transforms.ColorJitter(0.1, 0.1, 0.1)
             rgb = color_transform(rgb)
@@ -827,7 +871,10 @@ class DatasetTriModalHercules(Dataset):
                 rgb = TTF.hflip(rgb)
             rgb = TTF.rotate(rgb, img_rotation)
         rgb = to_tensor(rgb)
-        rgb = normalization(rgb)
+        if not self.project_on_gpu:
+            normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                 std=[0.229, 0.224, 0.225])
+            rgb = normalization(rgb)
         return rgb
 
     def _load_image(self, image_path):
@@ -909,8 +956,18 @@ class DatasetTriModalHercules(Dataset):
         if self.input_size is not None:
             rgb = F.interpolate(rgb.unsqueeze(0), size=self.input_size, mode='bilinear', align_corners=False).squeeze(0)
 
-        lidar_pc = _load_point_cloud(lidar_path, self.pcd_reader)
-        radar_pc = _load_point_cloud(radar_path, self.pcd_reader)
+        lidar_pc = _load_point_cloud(
+            lidar_path,
+            self.pcd_reader,
+            use_cache=self.pointcloud_cache,
+            write_cache=self.pointcloud_cache_write,
+        )
+        radar_pc = _load_point_cloud(
+            radar_path,
+            self.pcd_reader,
+            use_cache=self.pointcloud_cache,
+            write_cache=self.pointcloud_cache_write,
+        )
         image_hw = (img.height, img.width)
         calib = scene_info['K']
 
@@ -1074,8 +1131,18 @@ class TriSequenceDataset(Dataset):
             'rgb': rgb.float(),
             'calib': calib,
             'image_hw': (img.height, img.width),
-            'lidar_pc': _load_point_cloud(lidar_path, self.base_dataset.pcd_reader),
-            'radar_pc': _load_point_cloud(radar_path, self.base_dataset.pcd_reader),
+            'lidar_pc': _load_point_cloud(
+                lidar_path,
+                self.base_dataset.pcd_reader,
+                use_cache=getattr(self.base_dataset, 'pointcloud_cache', True),
+                write_cache=getattr(self.base_dataset, 'pointcloud_cache_write', True),
+            ),
+            'radar_pc': _load_point_cloud(
+                radar_path,
+                self.base_dataset.pcd_reader,
+                use_cache=getattr(self.base_dataset, 'pointcloud_cache', True),
+                write_cache=getattr(self.base_dataset, 'pointcloud_cache_write', True),
+            ),
             'T_cam_lidar_gt': T_cam_lidar_gt,
             'T_cam_radar_gt': T_cam_radar_gt,
             'T_lidar_radar_gt': T_lidar_radar_gt,

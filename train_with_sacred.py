@@ -40,7 +40,14 @@ from models.tri_joint.model import TriModalJointCalibNetV2
 from quaternion_distances import quaternion_distance
 
 from tensorboardX import SummaryWriter
-from utils import merge_inputs, overlay_imgs, quat2mat, project_pointcloud_to_image_torch, quaternion_from_matrix
+from utils import (
+    merge_inputs,
+    overlay_imgs,
+    quat2mat,
+    project_pointcloud_to_image_torch,
+    project_pointclouds_to_image_torch_batched,
+    quaternion_from_matrix,
+)
 
 try:
     import wandb
@@ -114,6 +121,8 @@ def config():
     tri_recurrent_hidden_dim = 256
     tri_frame_cache_size = 32
     tri_project_on_gpu = True
+    tri_pointcloud_cache = True
+    tri_pointcloud_cache_write = True
     tri_use_amp = True
     tri_amp_dtype = 'fp16'  # 'fp16' or 'bf16'
     tri_use_compile = True
@@ -240,6 +249,8 @@ def main(_config, _run, seed):
     common_kwargs['input_size'] = input_size
     common_kwargs['max_depth'] = _config['max_depth']
     common_kwargs['project_on_gpu'] = _config.get('tri_project_on_gpu', False)
+    common_kwargs['pointcloud_cache'] = _config.get('tri_pointcloud_cache', True)
+    common_kwargs['pointcloud_cache_write'] = _config.get('tri_pointcloud_cache_write', True)
 
     dataset_train = dataset_class(
         _config['data_folder'],
@@ -575,6 +586,73 @@ def main(_config, _run, seed):
                 return pred_out, new_state_out, {}
         return out, None, {}
 
+    rgb_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 1, 3, 1, 1)
+    rgb_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 1, 3, 1, 1)
+
+    def _prepare_rgb_batch(rgb_batch):
+        rgb_batch = rgb_batch.to(device, non_blocking=True)
+        if rgb_batch.ndim == 4:
+            rgb_batch = rgb_batch.unsqueeze(1)
+            squeeze_seq = True
+        else:
+            squeeze_seq = False
+
+        rgb_batch = rgb_batch.float()
+        if _config.get('tri_project_on_gpu', False):
+            rgb_batch = (rgb_batch - rgb_mean) / rgb_std
+
+        if squeeze_seq:
+            rgb_batch = rgb_batch.squeeze(1)
+        return rgb_batch
+
+    def _project_batch_with_optional_vectorization(pc_tensor, pc_mask, T_tensor, calib_tensor, image_hw_tensor):
+        flat_hw = image_hw_tensor.reshape(-1, 2)
+        same_hw = bool(torch.all(flat_hw == flat_hw[:1]).item())
+        if same_hw:
+            return project_pointclouds_to_image_torch_batched(
+                pc_tensor,
+                pc_mask,
+                T_tensor,
+                calib_tensor,
+                image_hw_tensor,
+                _config['max_depth'],
+            )
+
+        leading_shape = pc_tensor.shape[:-2]
+        flat_pc = pc_tensor.reshape(-1, pc_tensor.shape[-2], pc_tensor.shape[-1])
+        flat_mask = pc_mask.reshape(-1, pc_mask.shape[-1])
+        flat_T = T_tensor.reshape(-1, 4, 4)
+        flat_calib = calib_tensor.reshape(-1, 3, 3)
+        flat_hw = image_hw_tensor.reshape(-1, 2)
+
+        depth_list = []
+        aux_list = []
+        for i in range(flat_pc.shape[0]):
+            points = flat_pc[i][flat_mask[i]]
+            depth, aux = project_pointcloud_to_image_torch(
+                points,
+                flat_T[i],
+                flat_calib[i],
+                flat_hw[i].tolist(),
+                _config['max_depth'],
+            )
+            depth_list.append(depth)
+            aux_list.append(aux)
+
+        h_max = max(depth.shape[0] for depth in depth_list)
+        w_max = max(depth.shape[1] for depth in depth_list)
+        depth_tensor = torch.zeros((len(depth_list), h_max, w_max), device=device, dtype=flat_pc.dtype)
+        aux_tensor = torch.zeros_like(depth_tensor)
+        for i, (depth, aux) in enumerate(zip(depth_list, aux_list)):
+            h, w = depth.shape
+            depth_tensor[i, :h, :w] = depth
+            aux_tensor[i, :h, :w] = aux
+
+        return (
+            depth_tensor.reshape(*leading_shape, h_max, w_max),
+            aux_tensor.reshape(*leading_shape, h_max, w_max),
+        )
+
     def _build_tri_projection_batch(sample_batch):
         if 'lidar_proj' in sample_batch and 'radar_proj' in sample_batch:
             return (
@@ -584,53 +662,70 @@ def main(_config, _run, seed):
 
         input_size = dataset_train.input_size if getattr(dataset_train, 'input_size', None) is not None else (288, 512)
         if 'lidar_pc_seq' in sample_batch:
-            batch_size_local = len(sample_batch['lidar_pc_seq'])
-            seq_len_local = len(sample_batch['lidar_pc_seq'][0])
-            lidar_list = []
-            radar_list = []
+            lidar_pc_seq = sample_batch['lidar_pc_seq'].to(device, non_blocking=True)
+            radar_pc_seq = sample_batch['radar_pc_seq'].to(device, non_blocking=True)
+            lidar_mask_seq = sample_batch['lidar_pc_seq_mask'].to(device, non_blocking=True)
+            radar_mask_seq = sample_batch['radar_pc_seq_mask'].to(device, non_blocking=True)
             calib_seq = sample_batch['calib_seq'].to(device, non_blocking=True)
-            image_hw_seq = sample_batch['image_hw_seq']
+            image_hw_seq = sample_batch['image_hw_seq'].to(device, non_blocking=True)
             T_cl_input_seq = sample_batch['T_CL_input'].to(device, non_blocking=True)
             T_cr_input_seq = sample_batch['T_CR_input'].to(device, non_blocking=True)
-            for b in range(batch_size_local):
-                lidar_steps = []
-                radar_steps = []
-                for t in range(seq_len_local):
-                    lidar_pc = sample_batch['lidar_pc_seq'][b][t].to(device, non_blocking=True)
-                    radar_pc = sample_batch['radar_pc_seq'][b][t].to(device, non_blocking=True)
-                    calib = calib_seq[b, t]
-                    image_hw = image_hw_seq[b, t].tolist()
-                    lidar_depth, _ = project_pointcloud_to_image_torch(lidar_pc, T_cl_input_seq[b, t], calib, image_hw, _config['max_depth'])
-                    radar_depth, radar_aux = project_pointcloud_to_image_torch(radar_pc, T_cr_input_seq[b, t], calib, image_hw, _config['max_depth'])
-                    lidar_steps.append(lidar_depth.unsqueeze(0))
-                    radar_steps.append(torch.stack([radar_depth, radar_aux], dim=0))
-                lidar_tensor = torch.stack(lidar_steps, dim=0)
-                radar_tensor = torch.stack(radar_steps, dim=0)
-                if input_size is not None:
-                    lidar_tensor = F.interpolate(lidar_tensor, size=input_size, mode='bilinear', align_corners=False)
-                    radar_tensor = F.interpolate(radar_tensor, size=input_size, mode='bilinear', align_corners=False)
-                lidar_list.append(lidar_tensor)
-                radar_list.append(radar_tensor)
-            return torch.stack(lidar_list, dim=0), torch.stack(radar_list, dim=0)
+            lidar_depth, _ = _project_batch_with_optional_vectorization(
+                lidar_pc_seq,
+                lidar_mask_seq,
+                T_cl_input_seq,
+                calib_seq,
+                image_hw_seq,
+            )
+            radar_depth, radar_aux = _project_batch_with_optional_vectorization(
+                radar_pc_seq,
+                radar_mask_seq,
+                T_cr_input_seq,
+                calib_seq,
+                image_hw_seq,
+            )
+            lidar_tensor = lidar_depth.unsqueeze(2)
+            radar_tensor = torch.stack([radar_depth, radar_aux], dim=2)
+            bsz, seq_len = lidar_tensor.shape[:2]
+            if input_size is not None:
+                lidar_tensor = F.interpolate(
+                    lidar_tensor.reshape(bsz * seq_len, 1, lidar_tensor.shape[-2], lidar_tensor.shape[-1]),
+                    size=input_size,
+                    mode='bilinear',
+                    align_corners=False,
+                ).reshape(bsz, seq_len, 1, input_size[0], input_size[1])
+                radar_tensor = F.interpolate(
+                    radar_tensor.reshape(bsz * seq_len, 2, radar_tensor.shape[-2], radar_tensor.shape[-1]),
+                    size=input_size,
+                    mode='bilinear',
+                    align_corners=False,
+                ).reshape(bsz, seq_len, 2, input_size[0], input_size[1])
+            return lidar_tensor, radar_tensor
 
-        batch_size_local = len(sample_batch['lidar_pc'])
         calib_batch = sample_batch['calib'].to(device, non_blocking=True)
-        image_hw_batch = sample_batch['image_hw']
+        image_hw_batch = sample_batch['image_hw'].to(device, non_blocking=True)
         T_cl_input_batch = sample_batch['T_CL_input'].to(device, non_blocking=True)
         T_cr_input_batch = sample_batch['T_CR_input'].to(device, non_blocking=True)
-        lidar_list = []
-        radar_list = []
-        for b in range(batch_size_local):
-            lidar_pc = sample_batch['lidar_pc'][b].to(device, non_blocking=True)
-            radar_pc = sample_batch['radar_pc'][b].to(device, non_blocking=True)
-            calib = calib_batch[b]
-            image_hw = image_hw_batch[b].tolist()
-            lidar_depth, _ = project_pointcloud_to_image_torch(lidar_pc, T_cl_input_batch[b], calib, image_hw, _config['max_depth'])
-            radar_depth, radar_aux = project_pointcloud_to_image_torch(radar_pc, T_cr_input_batch[b], calib, image_hw, _config['max_depth'])
-            lidar_list.append(lidar_depth.unsqueeze(0))
-            radar_list.append(torch.stack([radar_depth, radar_aux], dim=0))
-        lidar_tensor = torch.stack(lidar_list, dim=0)
-        radar_tensor = torch.stack(radar_list, dim=0)
+        lidar_pc = sample_batch['lidar_pc'].to(device, non_blocking=True)
+        radar_pc = sample_batch['radar_pc'].to(device, non_blocking=True)
+        lidar_mask = sample_batch['lidar_pc_mask'].to(device, non_blocking=True)
+        radar_mask = sample_batch['radar_pc_mask'].to(device, non_blocking=True)
+        lidar_depth, _ = _project_batch_with_optional_vectorization(
+            lidar_pc,
+            lidar_mask,
+            T_cl_input_batch,
+            calib_batch,
+            image_hw_batch,
+        )
+        radar_depth, radar_aux = _project_batch_with_optional_vectorization(
+            radar_pc,
+            radar_mask,
+            T_cr_input_batch,
+            calib_batch,
+            image_hw_batch,
+        )
+        lidar_tensor = lidar_depth.unsqueeze(1)
+        radar_tensor = torch.stack([radar_depth, radar_aux], dim=1)
         if input_size is not None:
             lidar_tensor = F.interpolate(lidar_tensor, size=input_size, mode='bilinear', align_corners=False)
             radar_tensor = F.interpolate(radar_tensor, size=input_size, mode='bilinear', align_corners=False)
@@ -640,7 +735,7 @@ def main(_config, _run, seed):
         is_tri_joint = _config['network'].startswith('TriJoint')
         model.train()
         sample = next(iter(TrainImgLoader))
-        rgb = sample['rgb'].to(device, non_blocking=True)
+        rgb = _prepare_rgb_batch(sample['rgb'])
         lidar_proj, radar_proj = _build_tri_projection_batch(sample)
         gt_batch = {
             'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
@@ -754,7 +849,7 @@ def main(_config, _run, seed):
 
         with torch.no_grad():
             for batch_idx, sample in enumerate(ValImgLoader):
-                rgb = sample['rgb'].to(device, non_blocking=True)
+                rgb = _prepare_rgb_batch(sample['rgb'])
                 lidar_proj, radar_proj = _build_tri_projection_batch(sample)
                 T_cl_input = sample['T_CL_input'].to(device, non_blocking=True)
                 T_cr_input = sample['T_CR_input'].to(device, non_blocking=True)
@@ -956,12 +1051,6 @@ def main(_config, _run, seed):
 
         return val_loss
 
-    if is_main_process:
-        print("Running initial validation before training...")
-        run_tri_validation(epoch=-1, train_epoch_loss=None)
-    if distributed:
-        dist.barrier()
-
     for epoch in range(starting_epoch, _config['epochs'] + 1):
         EPOCH = epoch
         if train_sampler is not None:
@@ -978,7 +1067,7 @@ def main(_config, _run, seed):
 
         model.train()
         for batch_idx, sample in enumerate(TrainImgLoader):
-            rgb = sample['rgb'].to(device, non_blocking=True)
+            rgb = _prepare_rgb_batch(sample['rgb'])
             lidar_proj, radar_proj = _build_tri_projection_batch(sample)
             gt_batch = {
                 'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
