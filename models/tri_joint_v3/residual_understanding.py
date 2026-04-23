@@ -40,12 +40,12 @@ class JointResidualUnderstanding(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.align_proj = nn.Sequential(
-            nn.Conv2d(15, 64, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(18, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.geom_proj = nn.Sequential(
-            nn.Conv2d(2, 32, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(6, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.1, inplace=True),
         )
@@ -58,7 +58,7 @@ class JointResidualUnderstanding(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.summary_mlp = nn.Sequential(
-            nn.Linear(d_res + 15, 128),
+            nn.Linear(d_res + 18, 128),
             nn.LayerNorm(128),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(128, 64),
@@ -141,10 +141,21 @@ class JointResidualUnderstanding(nn.Module):
         return out * center_mask
 
     def _range_residual(self, valid_lid: torch.Tensor, valid_rad: torch.Tensor) -> torch.Tensor:
-        # Placeholder geometric residual: support asymmetry and overlap.
+        # Keep sparse radar support visible through overlap / asymmetry / local densities.
         overlap = valid_lid * valid_rad                                  # [B,1,H,W]
         asym = torch.abs(valid_lid - valid_rad)                          # [B,1,H,W]
-        return torch.cat([overlap, asym], dim=1)                         # [B,2,H,W]
+        lid_density = F.avg_pool2d(valid_lid, kernel_size=5, stride=1, padding=2)
+        rad_density = F.avg_pool2d(valid_rad, kernel_size=5, stride=1, padding=2)
+        overlap_density = overlap * torch.maximum(lid_density, rad_density)
+        sparse_disagreement = asym * (0.5 + rad_density)
+        return torch.cat([
+            overlap,
+            asym,
+            lid_density,
+            rad_density,
+            overlap_density,
+            sparse_disagreement,
+        ], dim=1)                                                         # [B,6,H,W]
 
     def forward(
         self,
@@ -188,9 +199,10 @@ class JointResidualUnderstanding(nn.Module):
         support_cam_align = 0.2 + 0.8 * support_cam                         # [B,1,H/16,W/16]
         valid_lid_align = self._dilate_mask(valid_lid, kernel_size=5)        # [B,1,H/16,W/16]
         valid_rad_align = self._dilate_mask(valid_rad, kernel_size=5)        # [B,1,H/16,W/16]
+        radar_density = F.avg_pool2d(valid_rad, kernel_size=5, stride=1, padding=2)
         valid_cl = support_cam_align * valid_lid_align                      # [B,1,H/16,W/16]
-        valid_cr = support_cam_align * valid_rad_align                      # [B,1,H/16,W/16]
-        valid_lr = valid_lid_align * valid_rad_align                        # [B,1,H/16,W/16]
+        valid_cr = support_cam_align * valid_rad_align * (0.5 + 0.5 * radar_density)
+        valid_lr = valid_lid_align * valid_rad_align * (0.5 + 0.5 * radar_density)
         align_cl = self._local_soft_alignment_masked(cam_s16, lid_s16, valid_cl)       # [B,5,H/16,W/16]
         align_cr = self._local_soft_alignment_masked(cam_s16, rad_s16, valid_cr)       # [B,5,H/16,W/16]
         align_lr_disp = self._local_soft_alignment_masked(lid_s16, rad_s16, valid_lr)  # [B,5,H/16,W/16]
@@ -198,6 +210,9 @@ class JointResidualUnderstanding(nn.Module):
             align_cl,                                                       # CL: best/exp/disp_norm/dx/dy
             align_cr,                                                       # CR: best/exp/disp_norm/dx/dy
             align_lr_disp,                                                  # LR: best/exp/disp_norm/dx/dy
+            valid_cl,
+            valid_cr,
+            valid_lr,
         ], dim=1)                                                           # [B,15,H/16,W/16]
         local_align = self.align_proj(local_align_input)                    # [B,64,H/16,W/16]
 
@@ -214,6 +229,9 @@ class JointResidualUnderstanding(nn.Module):
             align_cl.mean(dim=(2, 3)),
             align_cr.mean(dim=(2, 3)),
             align_lr_disp.mean(dim=(2, 3)),
+            valid_cr.mean(dim=(2, 3)),
+            valid_lr.mean(dim=(2, 3)),
+            radar_density.mean(dim=(2, 3)),
         ], dim=1)                                                           # [B,15]
         e_align_summary = self.summary_mlp(torch.cat([e_joint, align_stats], dim=1))  # [B,64]
 

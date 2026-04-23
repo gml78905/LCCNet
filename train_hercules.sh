@@ -1,10 +1,12 @@
-export CUDA_VISIBLE_DEVICES=2,3
+set -euo pipefail
+
+export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
-CHECKPOINT_NAME="tri_joint_v3lite_align_v31_hercules"
-DATA_ROOT="/workspace/data/LG_Innotek/PublicDataset/hercules"
+CHECKPOINT_NAME="tri_joint_v3lite_radaraware_v32_hercules"
+DATA_ROOT="/workspace/data/hercules"
 TRAIN_SCENES='["SC_1","SC_3","island_1"]'
 VAL_SCENES='["library_1"]'
 

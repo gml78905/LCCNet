@@ -45,9 +45,11 @@ class ResidualAwareReliabilityEstimator(nn.Module):
         d_res: int = 192,
         d_summary: int = 64,
         range_reliability_floor: float = 0.05,
+        radar_reliability_floor: float = 0.15,
     ):
         super().__init__()
         self.range_reliability_floor = range_reliability_floor
+        self.radar_reliability_floor = radar_reliability_floor
         in_ch = d_joint + d_res + 2
         self.cam_head = _ResidualAwareReliabilityHead(in_ch=in_ch)
         self.lid_head = _ResidualAwareReliabilityHead(in_ch=in_ch)
@@ -102,11 +104,14 @@ class ResidualAwareReliabilityEstimator(nn.Module):
         camera_floor = 0.15 + 0.85 * support_cam
         R_cam = torch.sigmoid(R_cam_raw) * camera_floor                     # [B,1,H/16,W/16]
         # LiDAR/Radar remain validity-aware by construction, but valid cells get a
-        # small floor so sparse modalities do not collapse to near-zero everywhere.
+        # floor so sparse modalities do not collapse to near-zero everywhere.
         range_floor_lid = self.range_reliability_floor * valid_lid
-        range_floor_rad = self.range_reliability_floor * valid_rad
+        radar_density = torch.nn.functional.avg_pool2d(valid_rad.float(), kernel_size=5, stride=1, padding=2)
+        range_floor_rad = valid_rad * (
+            self.radar_reliability_floor * (0.5 + 0.5 * radar_density)
+        )
         R_lid = range_floor_lid + (1.0 - self.range_reliability_floor) * torch.sigmoid(R_lid_raw) * valid_lid
-        R_rad = range_floor_rad + (1.0 - self.range_reliability_floor) * torch.sigmoid(R_rad_raw) * valid_rad
+        R_rad = range_floor_rad + (1.0 - self.radar_reliability_floor) * torch.sigmoid(R_rad_raw) * valid_rad
 
         invalid_penalty = torch.cat([
             self._invalid_penalty(R_cam, support_cam),

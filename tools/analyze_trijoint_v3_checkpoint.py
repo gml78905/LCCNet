@@ -444,7 +444,7 @@ def main():
 
         with torch.no_grad():
             pred, new_state, aux = model(rgb, lidar_proj, radar_proj, state=None, return_aux=True)
-            losses = loss_fn(pred, batch)
+            losses = loss_fn(pred, batch, aux=aux)
 
         loss_rows.append({
             "batch_idx": batch_idx,

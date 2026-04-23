@@ -720,9 +720,16 @@ def main(_config, _run, seed):
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
+            need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
             debug_return_aux = bool(_config.get('tri_joint_debug_return_aux', True)) and is_tri_joint
-            pred, new_state_debug, aux_debug = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=debug_return_aux)
-            losses = loss_fn(pred, gt_batch)
+            pred, new_state_debug, aux_debug = _tri_model_forward(
+                model,
+                rgb,
+                lidar_proj,
+                radar_proj,
+                return_aux=(debug_return_aux or need_aux_for_loss),
+            )
+            losses = loss_fn(pred, gt_batch, aux=aux_debug if need_aux_for_loss else None)
         if is_main_process:
             print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
             print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
@@ -756,7 +763,9 @@ def main(_config, _run, seed):
                 f"CL={losses['loss_cl'].item():.6f} "
                 f"CR={losses['loss_cr'].item():.6f} "
                 f"LR={losses['loss_lr'].item():.6f} "
-                f"LOOP={losses['loss_loop'].item():.6f}"
+                f"LOOP={losses['loss_loop'].item():.6f} "
+                f"RADREL={losses['loss_radar_reliability'].item():.6f} "
+                f"ALIGN={losses['loss_align'].item():.6f}"
             )
         if tri_use_grad_scaler:
             tri_grad_scaler.scale(losses['total_loss']).backward()
@@ -827,8 +836,9 @@ def main(_config, _run, seed):
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    pred, _, _ = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=False)
-                    loss = loss_fn(pred, gt_batch)
+                    need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
+                    pred, _, aux_eval = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
+                    loss = loss_fn(pred, gt_batch, aux=aux_eval if need_aux_for_loss else None)
                 batch_item_count = _batch_item_count(rgb)
                 total_eval_count += batch_item_count
                 total_val_loss += loss['total_loss'].item() * batch_item_count
@@ -1046,8 +1056,9 @@ def main(_config, _run, seed):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                pred, _, _ = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=False)
-                loss = loss_fn(pred, gt_batch)
+                need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
+                pred, _, aux_train = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
+                loss = loss_fn(pred, gt_batch, aux=aux_train if need_aux_for_loss else None)
             if tri_use_grad_scaler:
                 tri_grad_scaler.scale(loss['total_loss']).backward()
                 tri_grad_scaler.unscale_(optimizer)

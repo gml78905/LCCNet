@@ -12,11 +12,26 @@ class TriModalPairwiseLoss(nn.Module):
       L_pair = w_t * SmoothL1(t_pred, t_gt) + w_q * quat_distance(q_pred, q_gt)
     """
 
-    def __init__(self, w_t=1.0, w_q=1.0, lambda_loop=0.0):
+    def __init__(
+        self,
+        w_t=1.0,
+        w_q=1.0,
+        lambda_loop=0.0,
+        lambda_invalid=0.02,
+        lambda_radar_reliability=0.05,
+        lambda_align=0.02,
+        target_radar_valid_mean=0.12,
+        target_align_mean=0.02,
+    ):
         super().__init__()
         self.w_t = float(w_t)
         self.w_q = float(w_q)
         self.lambda_loop = float(lambda_loop)
+        self.lambda_invalid = float(lambda_invalid)
+        self.lambda_radar_reliability = float(lambda_radar_reliability)
+        self.lambda_align = float(lambda_align)
+        self.target_radar_valid_mean = float(target_radar_valid_mean)
+        self.target_align_mean = float(target_align_mean)
         self.transl_loss = nn.SmoothL1Loss(reduction='none')
 
     @staticmethod
@@ -171,7 +186,51 @@ class TriModalPairwiseLoss(nn.Module):
         l_loop = self.w_t * l_loop_t + self.w_q * l_loop_q
         return l_loop, l_loop_t, l_loop_q
 
-    def forward(self, pred, batch):
+    def _aux_regularization(self, aux, device):
+        if aux is None or len(aux) == 0:
+            return {
+                'loss_invalid': torch.tensor(0.0, device=device),
+                'loss_radar_reliability': torch.tensor(0.0, device=device),
+                'loss_align': torch.tensor(0.0, device=device),
+            }
+
+        zero = torch.tensor(0.0, device=device)
+        invalid_penalty = aux.get('invalid_penalty')
+        if invalid_penalty is not None:
+            loss_invalid = invalid_penalty.mean()
+        else:
+            loss_invalid = zero
+
+        loss_radar_reliability = zero
+        if 'R_rad' in aux and 'valid_rad' in aux:
+            r_rad = aux['R_rad']
+            valid_rad = aux['valid_rad'].float()
+            den = valid_rad.sum(dim=tuple(range(2, valid_rad.ndim))).clamp(min=1e-6)
+            mean_valid = (r_rad * valid_rad).sum(dim=tuple(range(2, r_rad.ndim))) / den
+            loss_radar_reliability = torch.relu(
+                self.target_radar_valid_mean - mean_valid
+            ).mean()
+
+        loss_align = zero
+        align_terms = []
+        for key in ('align_cr', 'align_lr'):
+            if key in aux:
+                align = aux[key]
+                if align.ndim == 5:
+                    best_sim = align[:, :, 0].mean(dim=(1, 2, 3))
+                else:
+                    best_sim = align[:, 0].mean(dim=1)
+                align_terms.append(torch.relu(self.target_align_mean - best_sim).mean())
+        if align_terms:
+            loss_align = sum(align_terms) / len(align_terms)
+
+        return {
+            'loss_invalid': loss_invalid,
+            'loss_radar_reliability': loss_radar_reliability,
+            'loss_align': loss_align,
+        }
+
+    def forward(self, pred, batch, aux=None):
         delta_cl_t_gt, delta_cl_q_gt = self._delta_target(batch['T_CL_input'], batch['T_CL_t_gt'], batch['T_CL_q_gt'])
         delta_cr_t_gt, delta_cr_q_gt = self._delta_target(batch['T_CR_input'], batch['T_CR_t_gt'], batch['T_CR_q_gt'])
 
@@ -188,13 +247,23 @@ class TriModalPairwiseLoss(nn.Module):
         l_lr, l_lr_t, l_lr_q = self._pair_loss(pred['T_LR_t'], pred['T_LR_q'], delta_lr_t_gt, delta_lr_q_gt)
         l_pairwise = l_cl + l_cr + l_lr
         l_loop, l_loop_t, l_loop_q = self._loop_loss(pred, batch)
-        total = l_pairwise + self.lambda_loop * l_loop
+        aux_reg = self._aux_regularization(aux, device=delta_cl_t_gt.device)
+        total = (
+            l_pairwise
+            + self.lambda_loop * l_loop
+            + self.lambda_invalid * aux_reg['loss_invalid']
+            + self.lambda_radar_reliability * aux_reg['loss_radar_reliability']
+            + self.lambda_align * aux_reg['loss_align']
+        )
         return {
             'total_loss': total,
             'loss_pairwise': l_pairwise,
             'loss_loop': l_loop,
             'loss_loop_t': l_loop_t,
             'loss_loop_q': l_loop_q,
+            'loss_invalid': aux_reg['loss_invalid'],
+            'loss_radar_reliability': aux_reg['loss_radar_reliability'],
+            'loss_align': aux_reg['loss_align'],
             'loss_cl': l_cl,
             'loss_cr': l_cr,
             'loss_lr': l_lr,
