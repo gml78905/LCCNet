@@ -10,6 +10,12 @@ class TriModalPairwiseLoss(nn.Module):
     Minimal tri-modal pairwise loss:
       L = L_CL + L_CR + L_LR
       L_pair = w_t * SmoothL1(t_pred, t_gt) + w_q * quat_distance(q_pred, q_gt)
+
+    Current training objective intentionally keeps only:
+      - pairwise delta pose supervision
+      - tri-modal loop consistency
+
+    Any previous aux regularization hooks are disabled.
     """
 
     def __init__(
@@ -187,47 +193,13 @@ class TriModalPairwiseLoss(nn.Module):
         return l_loop, l_loop_t, l_loop_q
 
     def _aux_regularization(self, aux, device):
-        if aux is None or len(aux) == 0:
-            return {
-                'loss_invalid': torch.tensor(0.0, device=device),
-                'loss_radar_reliability': torch.tensor(0.0, device=device),
-                'loss_align': torch.tensor(0.0, device=device),
-            }
-
+        # Aux regularization terms are intentionally disabled.
+        # Keep zero-valued entries in the returned dict for logging compatibility.
         zero = torch.tensor(0.0, device=device)
-        invalid_penalty = aux.get('invalid_penalty')
-        if invalid_penalty is not None:
-            loss_invalid = invalid_penalty.mean()
-        else:
-            loss_invalid = zero
-
-        loss_radar_reliability = zero
-        if 'R_rad' in aux and 'valid_rad' in aux:
-            r_rad = aux['R_rad']
-            valid_rad = aux['valid_rad'].float()
-            den = valid_rad.sum(dim=tuple(range(2, valid_rad.ndim))).clamp(min=1e-6)
-            mean_valid = (r_rad * valid_rad).sum(dim=tuple(range(2, r_rad.ndim))) / den
-            loss_radar_reliability = torch.relu(
-                self.target_radar_valid_mean - mean_valid
-            ).mean()
-
-        loss_align = zero
-        align_terms = []
-        for key in ('align_cr', 'align_lr'):
-            if key in aux:
-                align = aux[key]
-                if align.ndim == 5:
-                    best_sim = align[:, :, 0].mean(dim=(1, 2, 3))
-                else:
-                    best_sim = align[:, 0].mean(dim=1)
-                align_terms.append(torch.relu(self.target_align_mean - best_sim).mean())
-        if align_terms:
-            loss_align = sum(align_terms) / len(align_terms)
-
         return {
-            'loss_invalid': loss_invalid,
-            'loss_radar_reliability': loss_radar_reliability,
-            'loss_align': loss_align,
+            'loss_invalid': zero,
+            'loss_radar_reliability': zero,
+            'loss_align': zero,
         }
 
     def forward(self, pred, batch, aux=None):
@@ -248,13 +220,7 @@ class TriModalPairwiseLoss(nn.Module):
         l_pairwise = l_cl + l_cr + l_lr
         l_loop, l_loop_t, l_loop_q = self._loop_loss(pred, batch)
         aux_reg = self._aux_regularization(aux, device=delta_cl_t_gt.device)
-        total = (
-            l_pairwise
-            + self.lambda_loop * l_loop
-            + self.lambda_invalid * aux_reg['loss_invalid']
-            + self.lambda_radar_reliability * aux_reg['loss_radar_reliability']
-            + self.lambda_align * aux_reg['loss_align']
-        )
+        total = l_pairwise + self.lambda_loop * l_loop
         return {
             'total_loss': total,
             'loss_pairwise': l_pairwise,

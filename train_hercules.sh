@@ -1,12 +1,12 @@
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=2,3
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
-CHECKPOINT_NAME="tri_joint_v3lite_radaraware_v32_hercules"
-DATA_ROOT="/workspace/data/hercules"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-tri_joint_v4_dense_joint_memory_hercules}"
+DATA_ROOT="${DATA_ROOT:-/workspace/data/LG_Innotek/PublicDataset/hercules}"
 TRAIN_SCENES='["SC_1","SC_3","island_1"]'
 VAL_SCENES='["library_1"]'
 
@@ -16,7 +16,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   dataset='hercules' \
   data_folder="${DATA_ROOT}" \
   sensor_mode='tri' \
-  network='TriJointV3Lite' \
+  network='TriJointV4' \
   checkpoint_name="${CHECKPOINT_NAME}" \
   use_dataparallel=True \
   tri_run_one_batch=False \

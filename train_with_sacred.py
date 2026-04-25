@@ -37,6 +37,7 @@ from DatasetLGInnotek import (
 from losses_tri import TriModalPairwiseLoss
 from models.tri_joint.model import TriModalJointCalibNetV2
 from models.tri_joint_v3.model import TriModalJointCalibNetV3Lite
+from models.tri_joint_v4.model import TriModalJointCalibNetV4
 
 from quaternion_distances import quaternion_distance
 
@@ -89,7 +90,7 @@ def config():
     max_r = 5.0 # 20.0, 10.0, 5.0,  2.0,  1.0
     batch_size = 120  # 120
     num_worker = 8
-    network = 'TriJointV2'
+    network = 'TriJointV4'
     optimizer = 'adam'
     resume = True
     weights = 'None'  # '/workspace/data/Checkpoint/LCCNet/kitti_iter5.tar'  # Set to None to start from scratch for Hercules
@@ -184,9 +185,9 @@ def main(_config, _run, seed):
         torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}" if distributed else "cuda")
 
-    if _config['network'] not in ['TriJointV2', 'TriJointV3Lite']:
+    if _config['network'] not in ['TriJointV2', 'TriJointV3Lite', 'TriJointV4']:
         raise ValueError(
-            f"Only network in ['TriJointV2', 'TriJointV3Lite'] is supported now, got {_config['network']}"
+            f"Only network in ['TriJointV2', 'TriJointV3Lite', 'TriJointV4'] is supported now, got {_config['network']}"
         )
     if _config['sensor_mode'].lower() != 'tri':
         raise ValueError(f"Only sensor_mode='tri' is supported now, got {_config['sensor_mode']}")
@@ -401,8 +402,15 @@ def main(_config, _run, seed):
             head_hidden_dim=256,
             head_dropout=_config['dropout'],
         )
-    else:
+    elif _config['network'] == 'TriJointV3Lite':
         model = TriModalJointCalibNetV3Lite(
+            camera_pretrained=False,
+            activation='leakyrelu',
+            head_hidden_dim=256,
+            head_dropout=_config['dropout'],
+        )
+    else:
+        model = TriModalJointCalibNetV4(
             camera_pretrained=False,
             activation='leakyrelu',
             head_hidden_dim=256,
@@ -523,7 +531,7 @@ def main(_config, _run, seed):
 
     def _tri_model_forward(forward_model, rgb_batch, lidar_batch, radar_batch, return_aux=False):
         """
-        TriJointV2 / TriJointV3Lite:
+        TriJointV2 / TriJointV3Lite / TriJointV4:
           out = (pred_dict, new_state) or (pred_dict, new_state, aux_dict)
         """
         if return_aux:
@@ -720,7 +728,7 @@ def main(_config, _run, seed):
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-            need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
+            need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
             debug_return_aux = bool(_config.get('tri_joint_debug_return_aux', True)) and is_tri_joint
             pred, new_state_debug, aux_debug = _tri_model_forward(
                 model,
@@ -836,7 +844,7 @@ def main(_config, _run, seed):
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
+                    need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
                     pred, _, aux_eval = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
                     loss = loss_fn(pred, gt_batch, aux=aux_eval if need_aux_for_loss else None)
                 batch_item_count = _batch_item_count(rgb)
@@ -1056,7 +1064,7 @@ def main(_config, _run, seed):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                need_aux_for_loss = (_config['network'] == 'TriJointV3Lite')
+                need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
                 pred, _, aux_train = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
                 loss = loss_fn(pred, gt_batch, aux=aux_train if need_aux_for_loss else None)
             if tri_use_grad_scaler:
