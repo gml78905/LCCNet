@@ -35,9 +35,7 @@ from DatasetLGInnotek import (
     _load_point_cloud,
 )
 from losses_tri import TriModalPairwiseLoss
-from models.tri_joint.model import TriModalJointCalibNetV2
-from models.tri_joint_v3.model import TriModalJointCalibNetV3Lite
-from models.tri_joint_v4.model import TriModalJointCalibNetV4
+from models.tri_joint_v5.model import TriModalJointCalibNetV5
 
 from quaternion_distances import quaternion_distance
 
@@ -67,6 +65,17 @@ ex = Experiment("LCCNet", save_git_info=save_git_info)
 ex.captured_out_filter = apply_backspaces_and_linefeeds
 
 
+def _center_crop_tensor_vertical_local(tensor, margin):
+    margin = int(margin or 0)
+    if margin <= 0:
+        return tensor
+    top = margin
+    bottom = tensor.shape[-2] - margin
+    if bottom <= top:
+        raise ValueError(f"Invalid vertical crop margin={margin} for height={tensor.shape[-2]}")
+    return tensor[..., top:bottom, :]
+
+
 # noinspection PyUnusedLocal
 @ex.config
 def config():
@@ -90,7 +99,7 @@ def config():
     max_r = 5.0 # 20.0, 10.0, 5.0,  2.0,  1.0
     batch_size = 120  # 120
     num_worker = 8
-    network = 'TriJointV4'
+    network = 'TriJointV5'
     optimizer = 'adam'
     resume = True
     weights = 'None'  # '/workspace/data/Checkpoint/LCCNet/kitti_iter5.tar'  # Set to None to start from scratch for Hercules
@@ -100,6 +109,8 @@ def config():
     norm = 'bn'
     dropout = 0.0
     max_depth = 80.
+    input_size = (288, 512)
+    input_crop_margin = 0
     weight_point_cloud = 0.5
     log_frequency = 10
     print_frequency = 50
@@ -112,7 +123,6 @@ def config():
     wandb_log_images = True
     debug_timing = False
     use_dataparallel = True
-    tri_run_one_batch = True
     tri_loss_w_t = 1.0
     tri_loss_w_q = 1.0
     tri_lambda_loop = 0.0
@@ -129,11 +139,21 @@ def config():
     tri_amp_dtype = 'fp16'  # 'fp16' or 'bf16'
     tri_use_compile = True
     tri_compile_mode = 'reduce-overhead'
-    tri_joint_debug_return_aux = True
-    tri_sync_batchnorm = True
-    tri_freeze_bn_after = 100  # Freeze BN running stats late in training to reduce DDP eval jitter.
     loader_persistent_workers = True
     loader_prefetch_factor = 4
+    tri_rgb_aug_prob = 0.8
+    tri_rgb_aug_brightness = 0.10
+    tri_rgb_aug_contrast = 0.10
+    tri_rgb_aug_saturation = 0.10
+    tri_rgb_aug_gamma = 0.10
+    tri_rgb_aug_noise_std = 0.01
+    tri_rgb_aug_blur_prob = 0.20
+    tri_spatial_aug_flip_prob = 0.50
+    tri_spatial_aug_rotate_prob = 0.50
+    tri_spatial_aug_rotate_deg = 5.0
+    tri_aug_camera_modality_dropout = 0.03
+    tri_aug_lidar_modality_dropout = 0.05
+    tri_aug_radar_modality_dropout = 0.10
 
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,10 +205,8 @@ def main(_config, _run, seed):
         torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}" if distributed else "cuda")
 
-    if _config['network'] not in ['TriJointV2', 'TriJointV3Lite', 'TriJointV4']:
-        raise ValueError(
-            f"Only network in ['TriJointV2', 'TriJointV3Lite', 'TriJointV4'] is supported now, got {_config['network']}"
-        )
+    if _config['network'] != 'TriJointV5':
+        raise ValueError(f"Only network='TriJointV5' is supported now, got {_config['network']}")
     if _config['sensor_mode'].lower() != 'tri':
         raise ValueError(f"Only sensor_mode='tri' is supported now, got {_config['sensor_mode']}")
     if _config['dataset'] not in ['hercules', 'lg_innotek']:
@@ -244,7 +262,7 @@ def main(_config, _run, seed):
     else:
         dataset_class = DatasetTriModalHercules
     img_shape = (720, 1280)
-    input_size = (288, 512)
+    input_size = tuple(_config.get('input_size', (288, 512)))
     checkpoints_dir = os.path.join(_config["checkpoints"], _config['dataset'])
 
     common_kwargs = {}
@@ -253,6 +271,7 @@ def main(_config, _run, seed):
     else:
         common_kwargs['val_frame_limit'] = _config.get('val_frame_limit')
     common_kwargs['input_size'] = input_size
+    common_kwargs['input_crop_margin'] = int(_config.get('input_crop_margin', 0))
     common_kwargs['max_depth'] = _config['max_depth']
     common_kwargs['project_on_gpu'] = _config.get('tri_project_on_gpu', False)
     common_kwargs['pointcloud_cache'] = _config.get('tri_pointcloud_cache', True)
@@ -395,32 +414,12 @@ def main(_config, _run, seed):
     #ex.info["tensorflow"] = {}
     #ex.info["tensorflow"]["logdirs"] = ['./logs/' + runs]
 
-    if _config['network'] == 'TriJointV2':
-        model = TriModalJointCalibNetV2(
-            camera_pretrained=False,
-            activation='leakyrelu',
-            head_hidden_dim=256,
-            head_dropout=_config['dropout'],
-        )
-    elif _config['network'] == 'TriJointV3Lite':
-        model = TriModalJointCalibNetV3Lite(
-            camera_pretrained=False,
-            activation='leakyrelu',
-            head_hidden_dim=256,
-            head_dropout=_config['dropout'],
-        )
-    else:
-        model = TriModalJointCalibNetV4(
-            camera_pretrained=False,
-            activation='leakyrelu',
-            head_hidden_dim=256,
-            head_dropout=_config['dropout'],
-        )
-
-    if distributed and _config.get('network', '').startswith('Tri') and _config.get('tri_sync_batchnorm', True):
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        if is_main_process:
-            print("[Tri] SyncBatchNorm enabled for distributed training")
+    model = TriModalJointCalibNetV5(
+        camera_pretrained=False,
+        activation='leakyrelu',
+        head_hidden_dim=256,
+        head_dropout=_config['dropout'],
+    )
 
     if _config['weights'] is not None and os.path.exists(_config['weights']):
         print(f"Loading weights from {_config['weights']}")
@@ -495,8 +494,6 @@ def main(_config, _run, seed):
     starting_epoch = 0
 
     def _batch_item_count(rgb_tensor):
-        if rgb_tensor.ndim == 5:
-            return rgb_tensor.shape[0] * rgb_tensor.shape[1]
         return rgb_tensor.shape[0]
 
     def _flatten_pose_tensor(tensor):
@@ -530,10 +527,7 @@ def main(_config, _run, seed):
         return corrected_t, corrected_q, corrected_T
 
     def _tri_model_forward(forward_model, rgb_batch, lidar_batch, radar_batch, return_aux=False):
-        """
-        TriJointV2 / TriJointV3Lite / TriJointV4:
-          out = (pred_dict, new_state) or (pred_dict, new_state, aux_dict)
-        """
+        """TriJointV5 returns (pred_dict, new_state) or (pred_dict, new_state, aux_dict)."""
         if return_aux:
             out = forward_model(rgb_batch, lidar_batch, radar_batch, state=None, return_aux=True)
         else:
@@ -547,12 +541,6 @@ def main(_config, _run, seed):
                 return pred_out, new_state_out, {}
         return out, None, {}
 
-    def _set_batchnorm_eval(module):
-        # Keep affine BN parameters trainable, but stop running-stat updates.
-        for child in module.modules():
-            if isinstance(child, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
-                child.eval()
-
     rgb_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 1, 3, 1, 1)
     rgb_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 1, 3, 1, 1)
 
@@ -565,12 +553,185 @@ def main(_config, _run, seed):
             squeeze_seq = False
 
         rgb_batch = rgb_batch.float()
-        if _config.get('tri_project_on_gpu', False):
-            rgb_batch = (rgb_batch - rgb_mean) / rgb_std
-
+        rgb_batch = (rgb_batch - rgb_mean) / rgb_std
         if squeeze_seq:
             rgb_batch = rgb_batch.squeeze(1)
         return rgb_batch
+
+    def _augment_rgb_batch(rgb_batch):
+        aug_prob = float(_config.get('tri_rgb_aug_prob', 0.0))
+        if aug_prob <= 0.0:
+            return rgb_batch
+
+        squeeze_seq = False
+        if rgb_batch.ndim == 4:
+            rgb_batch = rgb_batch.unsqueeze(1)
+            squeeze_seq = True
+        elif rgb_batch.ndim != 5:
+            raise ValueError(f"Unexpected RGB batch shape for augmentation: {tuple(rgb_batch.shape)}")
+
+        bsz, seq_len, channels, height, width = rgb_batch.shape
+        flat = rgb_batch.reshape(bsz * seq_len, channels, height, width)
+
+        apply_mask = (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) < aug_prob).to(flat.dtype)
+
+        brightness = float(_config.get('tri_rgb_aug_brightness', 0.0))
+        if brightness > 0.0:
+            factor = 1.0 + (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) * 2.0 - 1.0) * brightness
+            aug = flat * factor
+            flat = torch.lerp(flat, aug, apply_mask)
+
+        contrast = float(_config.get('tri_rgb_aug_contrast', 0.0))
+        if contrast > 0.0:
+            mean = flat.mean(dim=(1, 2, 3), keepdim=True)
+            factor = 1.0 + (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) * 2.0 - 1.0) * contrast
+            aug = (flat - mean) * factor + mean
+            flat = torch.lerp(flat, aug, apply_mask)
+
+        saturation = float(_config.get('tri_rgb_aug_saturation', 0.0))
+        if saturation > 0.0:
+            gray = flat.mean(dim=1, keepdim=True)
+            factor = 1.0 + (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) * 2.0 - 1.0) * saturation
+            aug = gray + (flat - gray) * factor
+            flat = torch.lerp(flat, aug, apply_mask)
+
+        gamma = float(_config.get('tri_rgb_aug_gamma', 0.0))
+        if gamma > 0.0:
+            gamma_factor = 1.0 + (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) * 2.0 - 1.0) * gamma
+            aug = torch.clamp(flat, 0.0, 1.0).pow(gamma_factor)
+            flat = torch.lerp(flat, aug, apply_mask)
+
+        blur_prob = float(_config.get('tri_rgb_aug_blur_prob', 0.0))
+        if blur_prob > 0.0:
+            blur_mask = (torch.rand(flat.shape[0], 1, 1, 1, device=flat.device) < blur_prob).to(flat.dtype) * apply_mask
+            aug = F.avg_pool2d(flat, kernel_size=3, stride=1, padding=1)
+            flat = torch.lerp(flat, aug, blur_mask)
+
+        noise_std = float(_config.get('tri_rgb_aug_noise_std', 0.0))
+        if noise_std > 0.0:
+            noise = torch.randn_like(flat) * noise_std
+            aug = flat + noise
+            flat = torch.lerp(flat, aug, apply_mask)
+
+        flat = torch.clamp(flat, 0.0, 1.0)
+        rgb_batch = flat.reshape(bsz, seq_len, channels, height, width)
+        if squeeze_seq:
+            rgb_batch = rgb_batch.squeeze(1)
+        return rgb_batch
+
+    def _apply_joint_spatial_aug(rgb_batch, lidar_batch, radar_batch):
+        flip_prob = float(_config.get('tri_spatial_aug_flip_prob', 0.0))
+        rotate_prob = float(_config.get('tri_spatial_aug_rotate_prob', 0.0))
+        rotate_deg = float(_config.get('tri_spatial_aug_rotate_deg', 0.0))
+        if flip_prob <= 0.0 and (rotate_prob <= 0.0 or rotate_deg <= 0.0):
+            return rgb_batch, lidar_batch, radar_batch
+
+        squeeze_seq = False
+        if rgb_batch.ndim == 4:
+            rgb_batch = rgb_batch.unsqueeze(1)
+            lidar_batch = lidar_batch.unsqueeze(1)
+            radar_batch = radar_batch.unsqueeze(1)
+            squeeze_seq = True
+        elif rgb_batch.ndim != 5:
+            raise ValueError(f"Unexpected RGB batch shape for spatial augmentation: {tuple(rgb_batch.shape)}")
+
+        bsz, seq_len, _, height, width = rgb_batch.shape
+
+        if flip_prob > 0.0:
+            flip_mask = torch.rand(bsz, device=rgb_batch.device) < flip_prob
+            if flip_mask.any():
+                rgb_batch[flip_mask] = torch.flip(rgb_batch[flip_mask], dims=(-1,))
+                lidar_batch[flip_mask] = torch.flip(lidar_batch[flip_mask], dims=(-1,))
+                radar_batch[flip_mask] = torch.flip(radar_batch[flip_mask], dims=(-1,))
+
+        if rotate_prob > 0.0 and rotate_deg > 0.0:
+            rotate_mask = torch.rand(bsz, device=rgb_batch.device) < rotate_prob
+            if rotate_mask.any():
+                angles_deg = torch.zeros(bsz, device=rgb_batch.device, dtype=rgb_batch.dtype)
+                angles_deg[rotate_mask] = (torch.rand(int(rotate_mask.sum().item()), device=rgb_batch.device, dtype=rgb_batch.dtype) * 2.0 - 1.0) * rotate_deg
+                angles_rad = angles_deg * (math.pi / 180.0)
+                cos_a = torch.cos(angles_rad)
+                sin_a = torch.sin(angles_rad)
+
+                theta = torch.zeros(bsz, 2, 3, device=rgb_batch.device, dtype=rgb_batch.dtype)
+                theta[:, 0, 0] = cos_a
+                theta[:, 0, 1] = -sin_a
+                theta[:, 1, 0] = sin_a
+                theta[:, 1, 1] = cos_a
+
+                theta = theta.unsqueeze(1).expand(-1, seq_len, -1, -1).reshape(bsz * seq_len, 2, 3)
+                grid = F.affine_grid(
+                    theta,
+                    size=(bsz * seq_len, 1, height, width),
+                    align_corners=False,
+                )
+
+                rgb_flat = rgb_batch.reshape(bsz * seq_len, rgb_batch.shape[2], height, width)
+                lidar_flat = lidar_batch.reshape(bsz * seq_len, lidar_batch.shape[2], height, width)
+                radar_flat = radar_batch.reshape(bsz * seq_len, radar_batch.shape[2], height, width)
+
+                rgb_flat = F.grid_sample(
+                    rgb_flat,
+                    grid,
+                    mode='bilinear',
+                    padding_mode='zeros',
+                    align_corners=False,
+                )
+                lidar_flat = F.grid_sample(
+                    lidar_flat,
+                    grid,
+                    mode='nearest',
+                    padding_mode='zeros',
+                    align_corners=False,
+                )
+                radar_flat = F.grid_sample(
+                    radar_flat,
+                    grid,
+                    mode='nearest',
+                    padding_mode='zeros',
+                    align_corners=False,
+                )
+
+                rgb_batch = rgb_flat.reshape(bsz, seq_len, rgb_batch.shape[2], height, width)
+                lidar_batch = lidar_flat.reshape(bsz, seq_len, lidar_batch.shape[2], height, width)
+                radar_batch = radar_flat.reshape(bsz, seq_len, radar_batch.shape[2], height, width)
+
+        if squeeze_seq:
+            rgb_batch = rgb_batch.squeeze(1)
+            lidar_batch = lidar_batch.squeeze(1)
+            radar_batch = radar_batch.squeeze(1)
+        return rgb_batch, lidar_batch, radar_batch
+
+    def _select_last_sequence_step(sample_batch):
+        selected = {}
+        for key, value in sample_batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == _config.get('tri_seq_len', 4):
+                selected[key] = value[:, -1]
+            else:
+                selected[key] = value
+        return selected
+
+    def _append_normalized_dt(pc_tensor, camera_stamp_ns, time_index, keep_extra_indices):
+        xyz = pc_tensor[..., :3]
+        extra_channels = []
+        for idx in keep_extra_indices:
+            if pc_tensor.shape[-1] > idx:
+                extra_channels.append(pc_tensor[..., idx:idx + 1])
+            else:
+                extra_channels.append(torch.zeros_like(pc_tensor[..., :1]))
+
+        dt = torch.zeros_like(pc_tensor[..., 0])
+        if pc_tensor.shape[-1] > time_index:
+            dt = pc_tensor[..., time_index].float()
+            if camera_stamp_ns is not None:
+                camera_stamp = camera_stamp_ns.to(device=dt.device, dtype=dt.dtype)
+                while camera_stamp.ndim < dt.ndim:
+                    camera_stamp = camera_stamp.unsqueeze(-1)
+                dt = torch.where(dt.abs() > 1e6, (dt - camera_stamp) * 1e-9, dt)
+            dt = torch.clamp(dt / 0.1, min=-1.0, max=1.0)
+
+        parts = [xyz] + extra_channels + [dt.unsqueeze(-1)]
+        return torch.cat(parts, dim=-1)
 
     def _project_batch_with_optional_vectorization(pc_tensor, pc_mask, T_tensor, calib_tensor, image_hw_tensor):
         flat_hw = image_hw_tensor.reshape(-1, 2)
@@ -608,16 +769,18 @@ def main(_config, _run, seed):
 
         h_max = max(depth.shape[0] for depth in depth_list)
         w_max = max(depth.shape[1] for depth in depth_list)
+        c_max = max(aux.shape[0] for aux in aux_list) if len(aux_list) > 0 else 0
         depth_tensor = torch.zeros((len(depth_list), h_max, w_max), device=device, dtype=flat_pc.dtype)
-        aux_tensor = torch.zeros_like(depth_tensor)
+        aux_tensor = torch.zeros((len(depth_list), c_max, h_max, w_max), device=device, dtype=flat_pc.dtype)
         for i, (depth, aux) in enumerate(zip(depth_list, aux_list)):
             h, w = depth.shape
             depth_tensor[i, :h, :w] = depth
-            aux_tensor[i, :h, :w] = aux
+            if aux.shape[0] > 0:
+                aux_tensor[i, :aux.shape[0], :h, :w] = aux
 
         return (
             depth_tensor.reshape(*leading_shape, h_max, w_max),
-            aux_tensor.reshape(*leading_shape, h_max, w_max),
+            aux_tensor.reshape(*leading_shape, c_max, h_max, w_max),
         )
 
     def _build_tri_projection_batch(sample_batch):
@@ -628,6 +791,8 @@ def main(_config, _run, seed):
             )
 
         input_size = dataset_train.input_size if getattr(dataset_train, 'input_size', None) is not None else (288, 512)
+        input_crop_margin = int(getattr(dataset_train, 'input_crop_margin', 0))
+
         if 'lidar_pc_seq' in sample_batch:
             lidar_pc_seq = sample_batch['lidar_pc_seq'].to(device, non_blocking=True)
             radar_pc_seq = sample_batch['radar_pc_seq'].to(device, non_blocking=True)
@@ -635,162 +800,98 @@ def main(_config, _run, seed):
             radar_mask_seq = sample_batch['radar_pc_seq_mask'].to(device, non_blocking=True)
             calib_seq = sample_batch['calib_seq'].to(device, non_blocking=True)
             image_hw_seq = sample_batch['image_hw_seq'].to(device, non_blocking=True)
+            camera_stamp_seq = sample_batch['camera_stamp_ns'].to(device, non_blocking=True)
             T_cl_input_seq = sample_batch['T_CL_input'].to(device, non_blocking=True)
             T_cr_input_seq = sample_batch['T_CR_input'].to(device, non_blocking=True)
-            lidar_depth, _ = _project_batch_with_optional_vectorization(
-                lidar_pc_seq,
-                lidar_mask_seq,
-                T_cl_input_seq,
-                calib_seq,
-                image_hw_seq,
+
+            lidar_pc_proj = _append_normalized_dt(lidar_pc_seq, camera_stamp_seq, time_index=4, keep_extra_indices=[3])
+            radar_pc_proj = _append_normalized_dt(radar_pc_seq, camera_stamp_seq, time_index=7, keep_extra_indices=[3, 4])
+
+            lidar_depth, lidar_aux = _project_batch_with_optional_vectorization(
+                lidar_pc_proj, lidar_mask_seq, T_cl_input_seq, calib_seq, image_hw_seq
             )
             radar_depth, radar_aux = _project_batch_with_optional_vectorization(
-                radar_pc_seq,
-                radar_mask_seq,
-                T_cr_input_seq,
-                calib_seq,
-                image_hw_seq,
+                radar_pc_proj, radar_mask_seq, T_cr_input_seq, calib_seq, image_hw_seq
             )
-            lidar_tensor = lidar_depth.unsqueeze(2)
-            radar_tensor = torch.stack([radar_depth, radar_aux], dim=2)
+
+            lidar_intensity = lidar_aux[:, :, 0] if lidar_aux.shape[2] > 0 else torch.zeros_like(lidar_depth)
+            lidar_dt = lidar_aux[:, :, 1] if lidar_aux.shape[2] > 1 else torch.zeros_like(lidar_depth)
+            radar_velocity = radar_aux[:, :, 0] if radar_aux.shape[2] > 0 else torch.zeros_like(radar_depth)
+            radar_rcs = radar_aux[:, :, 1] if radar_aux.shape[2] > 1 else torch.zeros_like(radar_depth)
+            radar_dt = radar_aux[:, :, 2] if radar_aux.shape[2] > 2 else torch.zeros_like(radar_depth)
+
+            lidar_tensor = torch.stack([lidar_depth, lidar_intensity, lidar_dt], dim=2)
+            radar_tensor = torch.stack([radar_depth, radar_velocity, radar_rcs, radar_dt], dim=2)
+
             bsz, seq_len = lidar_tensor.shape[:2]
             if input_size is not None:
                 lidar_tensor = F.interpolate(
-                    lidar_tensor.reshape(bsz * seq_len, 1, lidar_tensor.shape[-2], lidar_tensor.shape[-1]),
+                    lidar_tensor.reshape(bsz * seq_len, 3, lidar_tensor.shape[-2], lidar_tensor.shape[-1]),
                     size=input_size,
                     mode='bilinear',
                     align_corners=False,
-                ).reshape(bsz, seq_len, 1, input_size[0], input_size[1])
+                ).reshape(bsz, seq_len, 3, input_size[0], input_size[1])
                 radar_tensor = F.interpolate(
-                    radar_tensor.reshape(bsz * seq_len, 2, radar_tensor.shape[-2], radar_tensor.shape[-1]),
+                    radar_tensor.reshape(bsz * seq_len, 4, radar_tensor.shape[-2], radar_tensor.shape[-1]),
                     size=input_size,
                     mode='bilinear',
                     align_corners=False,
-                ).reshape(bsz, seq_len, 2, input_size[0], input_size[1])
+                ).reshape(bsz, seq_len, 4, input_size[0], input_size[1])
+            if input_crop_margin > 0:
+                lidar_tensor = lidar_tensor[:, :, :, input_crop_margin:-input_crop_margin, :]
+                radar_tensor = radar_tensor[:, :, :, input_crop_margin:-input_crop_margin, :]
             return lidar_tensor, radar_tensor
 
         calib_batch = sample_batch['calib'].to(device, non_blocking=True)
         image_hw_batch = sample_batch['image_hw'].to(device, non_blocking=True)
+        camera_stamp_batch = sample_batch['camera_stamp_ns'].to(device, non_blocking=True)
         T_cl_input_batch = sample_batch['T_CL_input'].to(device, non_blocking=True)
         T_cr_input_batch = sample_batch['T_CR_input'].to(device, non_blocking=True)
         lidar_pc = sample_batch['lidar_pc'].to(device, non_blocking=True)
         radar_pc = sample_batch['radar_pc'].to(device, non_blocking=True)
         lidar_mask = sample_batch['lidar_pc_mask'].to(device, non_blocking=True)
         radar_mask = sample_batch['radar_pc_mask'].to(device, non_blocking=True)
-        lidar_depth, _ = _project_batch_with_optional_vectorization(
-            lidar_pc,
-            lidar_mask,
-            T_cl_input_batch,
-            calib_batch,
-            image_hw_batch,
+
+        lidar_pc_proj = _append_normalized_dt(lidar_pc, camera_stamp_batch, time_index=4, keep_extra_indices=[3])
+        radar_pc_proj = _append_normalized_dt(radar_pc, camera_stamp_batch, time_index=7, keep_extra_indices=[3, 4])
+
+        lidar_depth, lidar_aux = _project_batch_with_optional_vectorization(
+            lidar_pc_proj, lidar_mask, T_cl_input_batch, calib_batch, image_hw_batch
         )
         radar_depth, radar_aux = _project_batch_with_optional_vectorization(
-            radar_pc,
-            radar_mask,
-            T_cr_input_batch,
-            calib_batch,
-            image_hw_batch,
+            radar_pc_proj, radar_mask, T_cr_input_batch, calib_batch, image_hw_batch
         )
-        lidar_tensor = lidar_depth.unsqueeze(1)
-        radar_tensor = torch.stack([radar_depth, radar_aux], dim=1)
+
+        lidar_intensity = lidar_aux[:, 0] if lidar_aux.shape[1] > 0 else torch.zeros_like(lidar_depth)
+        lidar_dt = lidar_aux[:, 1] if lidar_aux.shape[1] > 1 else torch.zeros_like(lidar_depth)
+        radar_velocity = radar_aux[:, 0] if radar_aux.shape[1] > 0 else torch.zeros_like(radar_depth)
+        radar_rcs = radar_aux[:, 1] if radar_aux.shape[1] > 1 else torch.zeros_like(radar_depth)
+        radar_dt = radar_aux[:, 2] if radar_aux.shape[1] > 2 else torch.zeros_like(radar_depth)
+
+        lidar_tensor = torch.stack([lidar_depth, lidar_intensity, lidar_dt], dim=1)
+        radar_tensor = torch.stack([radar_depth, radar_velocity, radar_rcs, radar_dt], dim=1)
         if input_size is not None:
             lidar_tensor = F.interpolate(lidar_tensor, size=input_size, mode='bilinear', align_corners=False)
             radar_tensor = F.interpolate(radar_tensor, size=input_size, mode='bilinear', align_corners=False)
+        if input_crop_margin > 0:
+            lidar_tensor = lidar_tensor[:, :, input_crop_margin:-input_crop_margin, :]
+            radar_tensor = radar_tensor[:, :, input_crop_margin:-input_crop_margin, :]
         return lidar_tensor, radar_tensor
 
-    if _config['network'].startswith('Tri') and _config.get('tri_run_one_batch', True):
-        is_tri_joint = _config['network'].startswith('TriJoint')
-        model.train()
-        sample = next(iter(TrainImgLoader))
-        rgb = _prepare_rgb_batch(sample['rgb'])
-        lidar_proj, radar_proj = _build_tri_projection_batch(sample)
-        gt_batch = {
-            'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
-            'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
-            'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
-            'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
-            'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
-            'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
-            'T_CL_input': sample['T_CL_input'].to(device, non_blocking=True),
-            'T_CR_input': sample['T_CR_input'].to(device, non_blocking=True),
-        }
-        gt_batch['T_LR_input'] = torch.linalg.inv(gt_batch['T_CL_input']) @ gt_batch['T_CR_input']
-        if is_main_process:
-            print(f"[Tri Debug] rgb={tuple(rgb.shape)} lidar_proj={tuple(lidar_proj.shape)} radar_proj={tuple(radar_proj.shape)}")
-        if rgb.ndim == 5:
-            assert rgb.shape[2] == 3 and rgb.shape[3] == 288 and rgb.shape[4] == 512
-            assert lidar_proj.ndim == 5 and lidar_proj.shape[2] == 1 and lidar_proj.shape[3] == 288 and lidar_proj.shape[4] == 512
-            assert radar_proj.ndim == 5 and radar_proj.shape[2] == 2 and radar_proj.shape[3] == 288 and radar_proj.shape[4] == 512
-        else:
-            assert rgb.ndim == 4 and rgb.shape[1] == 3 and rgb.shape[2] == 288 and rgb.shape[3] == 512
-            assert lidar_proj.ndim == 4 and lidar_proj.shape[1] == 1 and lidar_proj.shape[2] == 288 and lidar_proj.shape[3] == 512
-            assert radar_proj.ndim == 4 and radar_proj.shape[1] == 2 and radar_proj.shape[2] == 288 and radar_proj.shape[3] == 512
+    def _apply_modality_dropout(proj_batch, drop_prob):
+        drop_prob = float(drop_prob or 0.0)
+        if drop_prob <= 0.0:
+            return proj_batch
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-            need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
-            debug_return_aux = bool(_config.get('tri_joint_debug_return_aux', True)) and is_tri_joint
-            pred, new_state_debug, aux_debug = _tri_model_forward(
-                model,
-                rgb,
-                lidar_proj,
-                radar_proj,
-                return_aux=(debug_return_aux or need_aux_for_loss),
-            )
-            losses = loss_fn(pred, gt_batch, aux=aux_debug if need_aux_for_loss else None)
-        if is_main_process:
-            print(f"[Tri Debug] T_CL_t={tuple(pred['T_CL_t'].shape)} T_CL_q={tuple(pred['T_CL_q'].shape)}")
-            print(f"[Tri Debug] T_CR_t={tuple(pred['T_CR_t'].shape)} T_CR_q={tuple(pred['T_CR_q'].shape)}")
-            print(f"[Tri Debug] T_LR_t={tuple(pred['T_LR_t'].shape)} T_LR_q={tuple(pred['T_LR_q'].shape)}")
-            if is_tri_joint and new_state_debug is not None:
-                state_shapes = " ".join(f"{k}={tuple(v.shape)}" for k, v in new_state_debug.items())
-                print(f"[TriJoint Debug] new_state {state_shapes}")
-            if is_tri_joint and debug_return_aux and len(aux_debug) > 0:
-                aux_keys = [
-                    'r_cl_coarse', 'w_c', 'w_cl', 'r_cl_ref', 'gate_cl', 'R_cam', 'r_cl0',
-                    'F_joint_map', 'E_joint_map', 'align_cl', 'z_lid_valid', 'z_rad_valid',
-                    'fusion_map_summary', 'summary_bias', 'z_joint_ref',
-                ]
-                for k in aux_keys:
-                    if k in aux_debug:
-                        print(f"[TriJoint Debug] aux[{k}]={tuple(aux_debug[k].shape)}")
-                if 'R_cam' in aux_debug:
-                    print(
-                        f"[TriJoint Debug] R_cam stats "
-                        f"mean={aux_debug['R_cam'].mean().item():.4f} "
-                        f"min={aux_debug['R_cam'].min().item():.4f} "
-                        f"max={aux_debug['R_cam'].max().item():.4f}"
-                    )
-        assert pred['T_CL_t'].shape[-1] == 3 and pred['T_CL_q'].shape[-1] == 4
-        assert pred['T_CR_t'].shape[-1] == 3 and pred['T_CR_q'].shape[-1] == 4
-        assert pred['T_LR_t'].shape[-1] == 3 and pred['T_LR_q'].shape[-1] == 4
-
-        if is_main_process:
-            print(
-                f"[Tri Debug] total_loss={losses['total_loss'].item():.6f} "
-                f"CL={losses['loss_cl'].item():.6f} "
-                f"CR={losses['loss_cr'].item():.6f} "
-                f"LR={losses['loss_lr'].item():.6f} "
-                f"LOOP={losses['loss_loop'].item():.6f} "
-                f"RADREL={losses['loss_radar_reliability'].item():.6f} "
-                f"ALIGN={losses['loss_align'].item():.6f}"
-            )
-        if tri_use_grad_scaler:
-            tri_grad_scaler.scale(losses['total_loss']).backward()
-            tri_grad_scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            tri_grad_scaler.step(optimizer)
-            tri_grad_scaler.update()
+        if proj_batch.ndim == 5:
+            keep_shape = (proj_batch.shape[0], proj_batch.shape[1], 1, 1, 1)
+        elif proj_batch.ndim == 4:
+            keep_shape = (proj_batch.shape[0], 1, 1, 1)
         else:
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        if distributed:
-            dist.barrier()
-        if is_main_process:
-            print("[Tri Debug] one-batch dataset -> model -> loss -> backward succeeded.")
-            return losses['total_loss'].item()
-        return None
+            raise ValueError(f"Unexpected projection tensor shape: {tuple(proj_batch.shape)}")
+
+        keep = (torch.rand(keep_shape, device=proj_batch.device) > drop_prob).to(dtype=proj_batch.dtype)
+        return proj_batch * keep
 
     def run_tri_validation(epoch, train_epoch_loss=None):
         nonlocal BEST_VAL_LOSS, val_iter
@@ -826,16 +927,17 @@ def main(_config, _run, seed):
             for batch_idx, sample in enumerate(ValImgLoader):
                 rgb = _prepare_rgb_batch(sample['rgb'])
                 lidar_proj, radar_proj = _build_tri_projection_batch(sample)
-                T_cl_input = sample['T_CL_input'].to(device, non_blocking=True)
-                T_cr_input = sample['T_CR_input'].to(device, non_blocking=True)
+                supervision_sample = _select_last_sequence_step(sample)
+                T_cl_input = supervision_sample['T_CL_input'].to(device, non_blocking=True)
+                T_cr_input = supervision_sample['T_CR_input'].to(device, non_blocking=True)
                 T_lr_input = torch.linalg.inv(T_cl_input) @ T_cr_input
                 gt_batch = {
-                    'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
-                    'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
-                    'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
-                    'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
-                    'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
-                    'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
+                    'T_CL_t_gt': supervision_sample['T_CL_t_gt'].to(device, non_blocking=True),
+                    'T_CL_q_gt': supervision_sample['T_CL_q_gt'].to(device, non_blocking=True),
+                    'T_CR_t_gt': supervision_sample['T_CR_t_gt'].to(device, non_blocking=True),
+                    'T_CR_q_gt': supervision_sample['T_CR_q_gt'].to(device, non_blocking=True),
+                    'T_LR_t_gt': supervision_sample['T_LR_t_gt'].to(device, non_blocking=True),
+                    'T_LR_q_gt': supervision_sample['T_LR_q_gt'].to(device, non_blocking=True),
                     'T_CL_input': T_cl_input,
                     'T_CR_input': T_cr_input,
                     'T_LR_input': T_lr_input,
@@ -844,9 +946,8 @@ def main(_config, _run, seed):
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
-                    pred, _, aux_eval = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
-                    loss = loss_fn(pred, gt_batch, aux=aux_eval if need_aux_for_loss else None)
+                    pred, _, _ = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=False)
+                    loss = loss_fn(pred, gt_batch, aux=None)
                 batch_item_count = _batch_item_count(rgb)
                 total_eval_count += batch_item_count
                 total_val_loss += loss['total_loss'].item() * batch_item_count
@@ -913,20 +1014,21 @@ def main(_config, _run, seed):
                             else:
                                 raise ValueError("Could not resolve camera intrinsic for tri validation visualization.")
                         orig_hw = (rgb_img.height, rgb_img.width)
-                        lidar_pc = _load_point_cloud(dataset_item['lidar_path'], base_dataset.pcd_reader)
-                        radar_pc = _load_point_cloud(dataset_item['radar_path'], base_dataset.pcd_reader)
+                        lidar_pc = _load_point_cloud(
+                            dataset_item['lidar_path'],
+                            base_dataset.pcd_reader,
+                            sensor_hint='lidar',
+                        )
+                        radar_pc = _load_point_cloud(
+                            dataset_item['radar_path'],
+                            base_dataset.pcd_reader,
+                            sensor_hint='radar',
+                        )
 
-                        if rgb.ndim == 5:
-                            pred_flat_index = show_idx * rgb.shape[1] + (time_idx % rgb.shape[1])
-                            T_cl_pred = flat_T_cl_pred[pred_flat_index].detach().cpu().numpy().astype(np.float32)
-                            T_cr_pred = flat_T_cr_pred[pred_flat_index].detach().cpu().numpy().astype(np.float32)
-                            T_cl_gt = _pose_to_matrix(gt_batch['T_CL_t_gt'][show_idx, time_idx], gt_batch['T_CL_q_gt'][show_idx, time_idx])
-                            T_cr_gt = _pose_to_matrix(gt_batch['T_CR_t_gt'][show_idx, time_idx], gt_batch['T_CR_q_gt'][show_idx, time_idx])
-                        else:
-                            T_cl_pred = flat_T_cl_pred[show_idx].detach().cpu().numpy().astype(np.float32)
-                            T_cr_pred = flat_T_cr_pred[show_idx].detach().cpu().numpy().astype(np.float32)
-                            T_cl_gt = _pose_to_matrix(gt_batch['T_CL_t_gt'][show_idx], gt_batch['T_CL_q_gt'][show_idx])
-                            T_cr_gt = _pose_to_matrix(gt_batch['T_CR_t_gt'][show_idx], gt_batch['T_CR_q_gt'][show_idx])
+                        T_cl_pred = flat_T_cl_pred[show_idx].detach().cpu().numpy().astype(np.float32)
+                        T_cr_pred = flat_T_cr_pred[show_idx].detach().cpu().numpy().astype(np.float32)
+                        T_cl_gt = _pose_to_matrix(gt_batch['T_CL_t_gt'][show_idx], gt_batch['T_CL_q_gt'][show_idx])
+                        T_cr_gt = _pose_to_matrix(gt_batch['T_CR_t_gt'][show_idx], gt_batch['T_CR_q_gt'][show_idx])
 
                         lidar_depth_pred, _ = base_dataset._project_to_image(lidar_pc, T_cl_pred, calib, orig_hw)
                         radar_depth_pred, _ = base_dataset._project_to_image(radar_pc, T_cr_pred, calib, orig_hw)
@@ -941,16 +1043,21 @@ def main(_config, _run, seed):
                         lidar_gt_vis = F.interpolate(lidar_gt_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
                         radar_pred_vis = F.interpolate(radar_pred_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
                         radar_gt_vis = F.interpolate(radar_gt_vis, size=ValImgLoader.dataset.input_size, mode='bilinear', align_corners=False)
+                        crop_margin = int(getattr(ValImgLoader.dataset, 'input_crop_margin', 0))
+                        lidar_pred_vis = _center_crop_tensor_vertical_local(lidar_pred_vis, crop_margin)
+                        lidar_gt_vis = _center_crop_tensor_vertical_local(lidar_gt_vis, crop_margin)
+                        radar_pred_vis = _center_crop_tensor_vertical_local(radar_pred_vis, crop_margin)
+                        radar_gt_vis = _center_crop_tensor_vertical_local(radar_gt_vis, crop_margin)
 
                         wandb_data = {
                             "epoch": epoch,
                             "val/rgb": _tensor_to_wandb_image(rgb_show),
-                            "val/rgb_lidar_overlay_input": wandb.Image(overlay_imgs(rgb_show, lidar_show.unsqueeze(0))),
-                            "val/rgb_radar_overlay_input": wandb.Image(overlay_imgs(rgb_show, radar_vis.unsqueeze(0))),
-                            "val/rgb_lidar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, lidar_gt_vis)),
-                            "val/rgb_radar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, radar_gt_vis)),
-                            "val/rgb_lidar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, lidar_pred_vis)),
-                            "val/rgb_radar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, radar_pred_vis)),
+                            "val/rgb_lidar_overlay_input": wandb.Image(overlay_imgs(rgb_show, lidar_show.unsqueeze(0), cmap_name='viridis')),
+                            "val/rgb_radar_overlay_input": wandb.Image(overlay_imgs(rgb_show, radar_vis.unsqueeze(0), cmap_name='plasma')),
+                            "val/rgb_lidar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, lidar_gt_vis, cmap_name='viridis')),
+                            "val/rgb_radar_overlay_gt": wandb.Image(overlay_imgs(rgb_show, radar_gt_vis, cmap_name='plasma')),
+                            "val/rgb_lidar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, lidar_pred_vis, cmap_name='viridis')),
+                            "val/rgb_radar_overlay_pred": wandb.Image(overlay_imgs(rgb_show, radar_pred_vis, cmap_name='plasma')),
                         }
                         _wandb_log(wandb_enabled, wandb_data)
 
@@ -1042,31 +1149,32 @@ def main(_config, _run, seed):
         _wandb_log(wandb_enabled, {"epoch": epoch, "train/lr": current_lr})
 
         model.train()
-        freeze_bn_after = _config.get('tri_freeze_bn_after')
-        if freeze_bn_after is not None and epoch >= int(freeze_bn_after):
-            _set_batchnorm_eval(model)
-            if is_main_process and epoch == int(freeze_bn_after):
-                print(f"[Tri] BatchNorm running stats frozen from epoch {epoch}")
         for batch_idx, sample in enumerate(TrainImgLoader):
-            rgb = _prepare_rgb_batch(sample['rgb'])
+            rgb_raw = sample['rgb'].to(device, non_blocking=True).float()
+            rgb_raw = _augment_rgb_batch(rgb_raw)
             lidar_proj, radar_proj = _build_tri_projection_batch(sample)
+            rgb_raw, lidar_proj, radar_proj = _apply_joint_spatial_aug(rgb_raw, lidar_proj, radar_proj)
+            rgb = _prepare_rgb_batch(rgb_raw)
+            rgb = _apply_modality_dropout(rgb, _config.get('tri_aug_camera_modality_dropout', 0.0))
+            lidar_proj = _apply_modality_dropout(lidar_proj, _config.get('tri_aug_lidar_modality_dropout', 0.0))
+            radar_proj = _apply_modality_dropout(radar_proj, _config.get('tri_aug_radar_modality_dropout', 0.0))
+            supervision_sample = _select_last_sequence_step(sample)
             gt_batch = {
-                'T_CL_t_gt': sample['T_CL_t_gt'].to(device, non_blocking=True),
-                'T_CL_q_gt': sample['T_CL_q_gt'].to(device, non_blocking=True),
-                'T_CR_t_gt': sample['T_CR_t_gt'].to(device, non_blocking=True),
-                'T_CR_q_gt': sample['T_CR_q_gt'].to(device, non_blocking=True),
-                'T_LR_t_gt': sample['T_LR_t_gt'].to(device, non_blocking=True),
-                'T_LR_q_gt': sample['T_LR_q_gt'].to(device, non_blocking=True),
-                'T_CL_input': sample['T_CL_input'].to(device, non_blocking=True),
-                'T_CR_input': sample['T_CR_input'].to(device, non_blocking=True),
+                'T_CL_t_gt': supervision_sample['T_CL_t_gt'].to(device, non_blocking=True),
+                'T_CL_q_gt': supervision_sample['T_CL_q_gt'].to(device, non_blocking=True),
+                'T_CR_t_gt': supervision_sample['T_CR_t_gt'].to(device, non_blocking=True),
+                'T_CR_q_gt': supervision_sample['T_CR_q_gt'].to(device, non_blocking=True),
+                'T_LR_t_gt': supervision_sample['T_LR_t_gt'].to(device, non_blocking=True),
+                'T_LR_q_gt': supervision_sample['T_LR_q_gt'].to(device, non_blocking=True),
+                'T_CL_input': supervision_sample['T_CL_input'].to(device, non_blocking=True),
+                'T_CR_input': supervision_sample['T_CR_input'].to(device, non_blocking=True),
             }
             gt_batch['T_LR_input'] = torch.linalg.inv(gt_batch['T_CL_input']) @ gt_batch['T_CR_input']
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                need_aux_for_loss = (_config['network'] in ['TriJointV3Lite', 'TriJointV4'])
-                pred, _, aux_train = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=need_aux_for_loss)
-                loss = loss_fn(pred, gt_batch, aux=aux_train if need_aux_for_loss else None)
+                pred, _, _ = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=False)
+                loss = loss_fn(pred, gt_batch, aux=None)
             if tri_use_grad_scaler:
                 tri_grad_scaler.scale(loss['total_loss']).backward()
                 tri_grad_scaler.unscale_(optimizer)
@@ -1106,7 +1214,7 @@ def main(_config, _run, seed):
             print("------------------------------------")
             _run.log_scalar("Total training loss", train_epoch_loss, epoch)
             _wandb_log(wandb_enabled, {"epoch": epoch, "train/epoch_loss": train_epoch_loss})
-        should_run_val = ((epoch + 1) % 20 == 0) or ((epoch + 1) > (_config['epochs'] - 10))
+        should_run_val = ((epoch + 1) % 10 == 0) or ((epoch + 1) > (_config['epochs'] - 10))
         if should_run_val and is_main_process:
             run_tri_validation(epoch=epoch, train_epoch_loss=train_epoch_loss)
         scheduler.step()

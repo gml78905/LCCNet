@@ -1,14 +1,29 @@
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=1,2
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
-CHECKPOINT_NAME="${CHECKPOINT_NAME:-tri_joint_v4_dense_joint_memory_hercules}"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-tri_joint_v5_6_hercules}"
 DATA_ROOT="${DATA_ROOT:-/workspace/data/LG_Innotek/PublicDataset/hercules}"
-TRAIN_SCENES='["SC_1","SC_3","island_1"]'
+TRAIN_SCENES='["SC_1","SC_3","island_1", "parking_lot_1"]'
 VAL_SCENES='["library_1"]'
+INPUT_SIZE='(540, 720)'
+INPUT_CROP_MARGIN=150
+TRI_RGB_AUG_PROB="${TRI_RGB_AUG_PROB:-0.6}"
+TRI_RGB_AUG_BRIGHTNESS="${TRI_RGB_AUG_BRIGHTNESS:-0.07}"
+TRI_RGB_AUG_CONTRAST="${TRI_RGB_AUG_CONTRAST:-0.07}"
+TRI_RGB_AUG_SATURATION="${TRI_RGB_AUG_SATURATION:-0.07}"
+TRI_RGB_AUG_GAMMA="${TRI_RGB_AUG_GAMMA:-0.05}"
+TRI_RGB_AUG_NOISE_STD="${TRI_RGB_AUG_NOISE_STD:-0.005}"
+TRI_RGB_AUG_BLUR_PROB="${TRI_RGB_AUG_BLUR_PROB:-0.10}"
+TRI_SPATIAL_AUG_FLIP_PROB="${TRI_SPATIAL_AUG_FLIP_PROB:-0.0}"
+TRI_SPATIAL_AUG_ROTATE_PROB="${TRI_SPATIAL_AUG_ROTATE_PROB:-0.0}"
+TRI_SPATIAL_AUG_ROTATE_DEG="${TRI_SPATIAL_AUG_ROTATE_DEG:-5.0}"
+TRI_AUG_CAMERA_DROPOUT="${TRI_AUG_CAMERA_DROPOUT:-0.02}"
+TRI_AUG_LIDAR_DROPOUT="${TRI_AUG_LIDAR_DROPOUT:-0.03}"
+TRI_AUG_RADAR_DROPOUT="${TRI_AUG_RADAR_DROPOUT:-0.05}"
 
 
 
@@ -16,10 +31,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   dataset='hercules' \
   data_folder="${DATA_ROOT}" \
   sensor_mode='tri' \
-  network='TriJointV4' \
+  network='TriJointV5' \
   checkpoint_name="${CHECKPOINT_NAME}" \
   use_dataparallel=True \
-  tri_run_one_batch=False \
   tri_use_sequence=True \
   tri_seq_len=4 \
   tri_seq_stride=1 \
@@ -27,9 +41,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   tri_project_on_gpu=True \
   tri_pointcloud_cache=True \
   tri_pointcloud_cache_write=True \
-  tri_joint_debug_return_aux=False \
-  batch_size=24 \
-  num_worker=16 \
+  batch_size=12 \
+  num_worker=12 \
   loader_persistent_workers=True \
   loader_prefetch_factor=4 \
   weights=None \
@@ -38,6 +51,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   train_scene="${TRAIN_SCENES}" \
   val_scene="${VAL_SCENES}" \
   val_frame_limit=3000 \
+  input_size="${INPUT_SIZE}" \
+  input_crop_margin=${INPUT_CROP_MARGIN} \
   max_depth=80.0 \
   max_r=5.0 \
   max_t=0.5 \
@@ -47,7 +62,17 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   tri_use_amp=True \
   tri_amp_dtype='fp16' \
   tri_use_compile=False \
-  tri_sync_batchnorm=True \
-  tri_freeze_bn_after=100 \
-  wandb_enabled=False \
-  wandb_mode='disabled'
+  tri_rgb_aug_prob=${TRI_RGB_AUG_PROB} \
+  tri_rgb_aug_brightness=${TRI_RGB_AUG_BRIGHTNESS} \
+  tri_rgb_aug_contrast=${TRI_RGB_AUG_CONTRAST} \
+  tri_rgb_aug_saturation=${TRI_RGB_AUG_SATURATION} \
+  tri_rgb_aug_gamma=${TRI_RGB_AUG_GAMMA} \
+  tri_rgb_aug_noise_std=${TRI_RGB_AUG_NOISE_STD} \
+  tri_rgb_aug_blur_prob=${TRI_RGB_AUG_BLUR_PROB} \
+  tri_spatial_aug_flip_prob=${TRI_SPATIAL_AUG_FLIP_PROB} \
+  tri_spatial_aug_rotate_prob=${TRI_SPATIAL_AUG_ROTATE_PROB} \
+  tri_spatial_aug_rotate_deg=${TRI_SPATIAL_AUG_ROTATE_DEG} \
+  tri_aug_camera_modality_dropout=${TRI_AUG_CAMERA_DROPOUT} \
+  tri_aug_lidar_modality_dropout=${TRI_AUG_LIDAR_DROPOUT} \
+  tri_aug_radar_modality_dropout=${TRI_AUG_RADAR_DROPOUT} \
+  wandb_enabled=True
