@@ -67,6 +67,12 @@ class EarlyTriModalEvidence(nn.Module):
         off = self.offset_embedding.t().view(1, self.proj_ch, self.num_offsets, 1, 1)
         return tokens + mod + off
 
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        valid = (valid > 0).to(values.dtype)
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return (values * valid).sum(dim=1, keepdim=True) / denom
+
     def forward(
         self,
         cam_feat: torch.Tensor,
@@ -117,9 +123,26 @@ class EarlyTriModalEvidence(nn.Module):
         ], dim=1)
         gate_bias = self.token_gate(gate_input).squeeze(1)
         scores = scores + gate_bias
+
+        lid_scores = scores[:, self.num_offsets:2 * self.num_offsets]
+        rad_scores = scores[:, 2 * self.num_offsets:3 * self.num_offsets]
+        lid_valid = lid_token_mask.squeeze(1)
+        rad_valid = rad_token_mask.squeeze(1)
+        lid_attn_hint = self._masked_mean(lid_scores, lid_valid)
+        rad_attn_hint = self._masked_mean(rad_scores, rad_valid)
+
         scores = scores.masked_fill(token_mask.squeeze(1) <= 0, -1e4)
         attn = torch.softmax(scores, dim=1)
         attended = (token_values * attn.unsqueeze(1)).sum(dim=2)
+
+        lid_attn = attn[:, self.num_offsets:2 * self.num_offsets]
+        rad_attn = attn[:, 2 * self.num_offsets:3 * self.num_offsets]
+        lid_attn_mean = self._masked_mean(lid_attn, lid_valid)
+        rad_attn_mean = self._masked_mean(rad_attn, rad_valid)
+
+        match_cl = torch.cat([lid_attn_hint, lid_attn_mean], dim=1)
+        match_cr = torch.cat([rad_attn_hint, rad_attn_mean], dim=1)
+        match_lr = torch.cat([lid_attn_hint, lid_attn_mean, rad_attn_hint, rad_attn_mean], dim=1)
 
         evidence = self.out_proj(torch.cat([attended, query], dim=1))
         return {
@@ -130,4 +153,7 @@ class EarlyTriModalEvidence(nn.Module):
             "p_cam": p_cam,
             "p_lid": p_lid,
             "p_rad": p_rad,
+            "match_cl": match_cl,
+            "match_cr": match_cr,
+            "match_lr": match_lr,
         }

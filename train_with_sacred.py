@@ -126,6 +126,9 @@ def config():
     tri_loss_w_t = 1.0
     tri_loss_w_q = 1.0
     tri_lambda_loop = 0.0
+    tri_lambda_rel_invalid = 0.05
+    tri_lambda_rel_match = 0.05
+    tri_lambda_rel_pair = 0.05
     tri_use_sequence = False
     tri_seq_len = 4
     tri_seq_stride = 1
@@ -407,6 +410,9 @@ def main(_config, _run, seed):
         _config.get('tri_loss_w_t', 1.0),
         _config.get('tri_loss_w_q', 1.0),
         _config.get('tri_lambda_loop', 0.0),
+        _config.get('tri_lambda_rel_invalid', 0.05),
+        _config.get('tri_lambda_rel_match', 0.05),
+        _config.get('tri_lambda_rel_pair', 0.05),
     )
 
     #runs = datetime.now().strftime('%b%d_%H-%M-%S') + "/"
@@ -466,7 +472,6 @@ def main(_config, _run, seed):
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     if _config['optimizer'] == 'adam':
         optimizer = optim.Adam(parameters, lr=_config['BASE_LEARNING_RATE'], weight_decay=5e-6)
-        # Probably this scheduler is not used
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 50, 70], gamma=0.5)
     else:
         optimizer = optim.SGD(parameters, lr=_config['BASE_LEARNING_RATE'], momentum=0.9,
@@ -946,8 +951,8 @@ def main(_config, _run, seed):
                 input_q_cr = _matrix_batch_to_quaternion(T_cr_input)
                 input_q_lr = _matrix_batch_to_quaternion(T_lr_input)
                 with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                    pred, _, _ = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=False)
-                    loss = loss_fn(pred, gt_batch, aux=None)
+                    pred, _, aux = _tri_model_forward(eval_model, rgb, lidar_proj, radar_proj, return_aux=True)
+                    loss = loss_fn(pred, gt_batch, aux=aux)
                 batch_item_count = _batch_item_count(rgb)
                 total_eval_count += batch_item_count
                 total_val_loss += loss['total_loss'].item() * batch_item_count
@@ -1173,8 +1178,8 @@ def main(_config, _run, seed):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=tri_amp_dtype, enabled=tri_amp_enabled):
-                pred, _, _ = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=False)
-                loss = loss_fn(pred, gt_batch, aux=None)
+                pred, _, aux = _tri_model_forward(model, rgb, lidar_proj, radar_proj, return_aux=True)
+                loss = loss_fn(pred, gt_batch, aux=aux)
             if tri_use_grad_scaler:
                 tri_grad_scaler.scale(loss['total_loss']).backward()
                 tri_grad_scaler.unscale_(optimizer)

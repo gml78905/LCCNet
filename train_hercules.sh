@@ -5,7 +5,7 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
-CHECKPOINT_NAME="${CHECKPOINT_NAME:-tri_joint_v5_6_hercules}"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-tri_joint_v5_12_hercules}"
 DATA_ROOT="${DATA_ROOT:-/workspace/data/LG_Innotek/PublicDataset/hercules}"
 TRAIN_SCENES='["SC_1","SC_3","island_1", "parking_lot_1"]'
 VAL_SCENES='["library_1"]'
@@ -59,6 +59,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 train_with_sacred.py with \
   tri_loss_w_t=1.0 \
   tri_loss_w_q=1.0 \
   tri_lambda_loop=0.1 \
+  tri_lambda_rel_invalid=0.05 \
+  tri_lambda_rel_match=0.05 \
+  tri_lambda_rel_pair=0.05 \
   tri_use_amp=True \
   tri_amp_dtype='fp16' \
   tri_use_compile=False \
